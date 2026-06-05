@@ -6,6 +6,9 @@ permissions:
 on:
   release:
     types: [published]
+  push:
+    tags:
+      - 'docker-rebuild-v*'
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PLATFORMS: linux/amd64,linux/arm/v7,linux/arm64
+  PLATFORMS: linux/amd64,linux/arm64
   IMAGE_NAME: cpxazn/crawl4ai
 
 jobs:
@@ -24,6 +27,47 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
+
+      - name: Extract version from release or rebuild tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=""
+          publish_latest="false"
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            version="${{ github.event.release.tag_name }}"
+            version="${version#v}"
+            if [ "${{ github.event.release.prerelease }}" != "true" ]; then
+              publish_latest="true"
+            fi
+          elif [[ "${GITHUB_REF_NAME}" == docker-rebuild-v* ]]; then
+            version="${GITHUB_REF_NAME#docker-rebuild-v}"
+            if [[ "${version}" != *-* ]]; then
+              publish_latest="true"
+            fi
+          fi
+
+          if [ -n "${version}" ]; then
+            major="${version%%.*}"
+            rest="${version#${major}.}"
+            if [ "${rest}" != "${version}" ]; then
+              minor_component="${rest%%.*}"
+              major_minor="${major}.${minor_component}"
+            else
+              major_minor=""
+            fi
+            echo "has_version=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "major=${major}" >> "$GITHUB_OUTPUT"
+            echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_version=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "publish_latest=${publish_latest}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -45,10 +89,10 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.has_version == 'true' }}
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ steps.version.outputs.major_minor != '' }}
+            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.major != '' }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.publish_latest == 'true' }}
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push Docker image
@@ -65,3 +109,5 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
