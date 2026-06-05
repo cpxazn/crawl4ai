@@ -54,6 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     pkg-config \
     python3-dev \
+    libffi-dev \
     libjpeg-dev \
     redis-tools${REDIS_VERSION:+=$REDIS_VERSION} \
     redis-server${REDIS_VERSION:+=$REDIS_VERSION} \
@@ -179,8 +180,6 @@ RUN playwright install --with-deps
 RUN mkdir -p /home/appuser/.cache/ms-playwright \
     && cp -r /root/.cache/ms-playwright/chromium-* /home/appuser/.cache/ms-playwright/ \
     && chown -R appuser:appuser /home/appuser/.cache/ms-playwright
-
-RUN crawl4ai-doctor
 
 # Ensure all cache directories belong to appuser
 # This fixes permission issues with .cache/url_seeder and other runtime cache dirs
