@@ -5,6 +5,14 @@ from utils import FilterType
 
 
 class CrawlRequest(BaseModel):
+    fields: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional list of CrawlResult fields to include in the response. "
+            "e.g. ['url', 'markdown', 'success'] to trim payload size. "
+            "If None, all fields are returned."
+        ),
+    )
     urls: List[str] = Field(min_length=1, max_length=100)
     browser_config: Optional[Dict] = Field(default_factory=dict)
     crawler_config: Optional[Dict] = Field(default_factory=dict)
@@ -112,6 +120,13 @@ class JSEndpointRequest(BaseModel):
     scripts: List[str] = Field(
         ...,
         description="List of separated JavaScript snippets to execute"
+    )
+    fields: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional list of CrawlResult fields to include in the response. "
+            "e.g. ['url', 'js_execution_result', 'markdown'] to trim payload size."
+        ),
     )
 
 

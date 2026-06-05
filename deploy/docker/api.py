@@ -57,6 +57,30 @@ import psutil, time
 logger = logging.getLogger(__name__)
 
 
+def _filter_result_fields(result_dict: dict, fields: Optional[List[str]] = None) -> dict:
+    """Filter a CrawlResult dict to only include specified fields.
+
+    If fields is None or empty, returns the full dict unchanged.
+    Supports nested field selection via dot notation (e.g. 'markdown.raw_markdown').
+    """
+    if not fields:
+        return result_dict
+
+    filtered = {}
+    for field in fields:
+        if '.' in field:
+            # Nested field: e.g. 'markdown.raw_markdown'
+            parent, child = field.split('.', 1)
+            if parent in result_dict and isinstance(result_dict[parent], dict):
+                if parent not in filtered:
+                    filtered[parent] = {}
+                if child in result_dict[parent]:
+                    filtered[parent][child] = result_dict[parent][child]
+        elif field in result_dict:
+            filtered[field] = result_dict[field]
+    return filtered
+
+
 def _enforce_proxy_safety(browser_config, crawler_config=None):
     """Block SSRF via a caller-supplied proxy / proxy-redirecting browser flags.
 
@@ -535,7 +559,11 @@ def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
 
     return response
 
-async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
+async def stream_results(
+    crawler: AsyncWebCrawler,
+    results_gen: AsyncGenerator,
+    fields: Optional[List[str]] = None,
+) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
     import json
     from utils import datetime_handler
@@ -553,6 +581,8 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None:
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+                # Filter to only requested fields
+                result_dict = _filter_result_fields(result_dict, fields)
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
                 data = json.dumps(result_dict, default=datetime_handler) + "\n"
                 yield data.encode('utf-8')
@@ -576,6 +606,7 @@ async def handle_crawl_request(
     config: dict,
     hooks_config: Optional[dict] = None,
     crawler_configs: Optional[List[dict]] = None,
+    fields: Optional[List[str]] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
     # Track request start
@@ -693,6 +724,9 @@ async def handle_crawl_request(
                 # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None and isinstance(result_dict.get('pdf'), bytes):
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+
+                # Filter to only requested fields
+                result_dict = _filter_result_fields(result_dict, fields)
                     
                 processed_results.append(result_dict)
             except Exception as e:
