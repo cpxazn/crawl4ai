@@ -541,6 +541,10 @@ async def execute_js(
         if not results[0].success:
             raise HTTPException(500, detail=results[0].error_message or "Crawl failed")
         data = results[0].model_dump()
+        # Filter to only requested fields
+        if body.fields:
+            from api import _filter_result_fields
+            data = _filter_result_fields(data, body.fields)
         return JSONResponse(data)
     except Exception as e:
         raise HTTPException(500, detail=str(e))
@@ -687,6 +691,7 @@ async def crawl(
         config=config,
         hooks_config=hooks_config,
         crawler_configs=crawl_request.crawler_configs,
+        fields=crawl_request.fields,
     )
     # check if all of the results are not successful
     if all(not result["success"] for result in results["results"]):
@@ -737,7 +742,7 @@ async def stream_process(crawl_request: CrawlRequestWithHooks):
         headers["X-Hooks-Status"] = json.dumps(hooks_info['status']['status'])
     
     return StreamingResponse(
-        stream_results(crawler, gen),
+        stream_results(crawler, gen, fields=crawl_request.fields),
         media_type="application/x-ndjson",
         headers=headers,
     )
