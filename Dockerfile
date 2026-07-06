@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     git \
     cmake \
+    libffi-dev \
     pkg-config \
     python3-dev \
     libjpeg-dev \
@@ -180,7 +181,6 @@ RUN mkdir -p /home/appuser/.cache/ms-playwright \
     && cp -r /root/.cache/ms-playwright/chromium-* /home/appuser/.cache/ms-playwright/ \
     && chown -R appuser:appuser /home/appuser/.cache/ms-playwright
 
-RUN crawl4ai-doctor
 
 # Ensure all cache directories belong to appuser
 # This fixes permission issues with .cache/url_seeder and other runtime cache dirs

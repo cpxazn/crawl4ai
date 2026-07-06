@@ -92,6 +92,8 @@ import psutil, time
 
 logger = logging.getLogger(__name__)
 
+from fork_field_filter import _filter_result_fields  # noqa: E402 — fork addition
+
 # --- Helper to get memory ---
 def _get_memory_mb():
     try:
@@ -599,7 +601,7 @@ def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
 
     return response
 
-async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) -> AsyncGenerator[bytes, None]:
+async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator, fields: Optional[List[str]] = None) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
     import json
     from utils import datetime_handler
@@ -617,6 +619,8 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None:
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+                # Filter to only requested fields
+                result_dict = _filter_result_fields(result_dict, fields)
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
                 data = json.dumps(result_dict, default=datetime_handler) + "\n"
                 yield data.encode('utf-8')
@@ -650,6 +654,7 @@ async def handle_crawl_request(
     crawler_config: dict,
     config: dict,
     hooks_config: Optional[dict] = None,
+    fields: Optional[List[str]] = None,
     crawler_configs: Optional[List[dict]] = None,
 ) -> dict:
     """Handle non-streaming crawl requests with optional hooks."""
@@ -767,6 +772,9 @@ async def handle_crawl_request(
                 # If PDF exists, encode it to base64
                 if result_dict.get('pdf') is not None and isinstance(result_dict.get('pdf'), bytes):
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
+                    
+                # Filter to only requested fields
+                result_dict = _filter_result_fields(result_dict, fields)
                     
                 processed_results.append(result_dict)
             except Exception as e:
