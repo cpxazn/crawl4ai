@@ -28,9 +28,13 @@ if [[ -n "${CRAWL4AI_API_TOKEN:-}" || "${CRAWL4AI_JWT_ENABLED:-false}" == "true"
     # A credential is configured -> the operator may expose all interfaces.
     GUNICORN_BIND="${GUNICORN_BIND:-[::]:${PORT}}"
 else
-    # No credential -> refuse to expose; serve loopback only.
-    GUNICORN_BIND="127.0.0.1:${PORT}"
-    echo "entrypoint: no CRAWL4AI_API_TOKEN set; binding loopback only (${GUNICORN_BIND})." >&2
+    # No credential -> default to loopback only. Set GUNICORN_BIND=0.0.0.0:PORT
+    # if you need Docker port mapping (the AuthGate still protects all routes).
+    GUNICORN_BIND="${GUNICORN_BIND:-127.0.0.1:${PORT}}"
+    if [[ "${GUNICORN_BIND}" == "127.0.0.1:${PORT}" ]]; then
+        echo "entrypoint: no CRAWL4AI_API_TOKEN set; binding loopback only (${GUNICORN_BIND})." >&2
+        echo "entrypoint: set GUNICORN_BIND=0.0.0.0:${PORT} if you need Docker port mapping." >&2
+    fi
 fi
 export GUNICORN_BIND
 
