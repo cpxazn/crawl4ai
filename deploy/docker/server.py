@@ -389,11 +389,16 @@ def _current_api_token() -> str:
     )
 
 
+# MCP transport paths are public only when no static API token is configured
+# (homelab/loopback posture). Individual tool calls remain authenticated via
+# the internal service token. When a token IS set, MCP stays behind auth.
+_mcp_public = not _current_api_token()
+
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_token,
     public_paths={HEALTH_PATH, "/token"},
-    public_prefixes=_UI_PREFIXES,
+    public_prefixes=_UI_PREFIXES + (("/mcp/",) if _mcp_public else ()),
 )
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
