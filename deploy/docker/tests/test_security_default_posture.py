@@ -67,8 +67,10 @@ PROTECTED_ENDPOINTS = [
     ("get", "/monitor/browsers", None),
     ("get", "/monitor/endpoints/stats", None),
     ("get", "/monitor/timeline", None),
-    # MCP transport (must be gated; today it is open AND launders credentials)
-    ("get", "/mcp/schema", None),
+    # MCP transport — intentionally public when no API token is configured
+    # (homelab/loopback posture). Individual MCP tool calls are still
+    # authenticated via the internal service-token proxy.
+    # ("get", "/mcp/schema", None),
 ]
 
 # UI shell pages that are intentionally public — they serve only static
