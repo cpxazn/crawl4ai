@@ -218,28 +218,32 @@ jobs:
           installed="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,os;print(os.path.realpath(crawl4ai.__file__))')"
           echo "image installed crawl4ai from: ${installed}"
 
-          status() {  # status <container> <path> <method>
-            docker exec "$1" python3 - "$2" "$3" <<'PY'
+          # Assertions run inside the container so a shell compare can never fail on
+          # formatting: each check prints what it saw and exits non-zero on a mismatch.
+          check() {  # check <container> <path> <method> <expected>
+            docker exec "$1" python3 - "$2" "$3" "$4" <<'CHK'
           import sys, urllib.request, urllib.error
-          path, method = sys.argv[1], sys.argv[2]
+          path, method, want = sys.argv[1], sys.argv[2], int(sys.argv[3])
           req = urllib.request.Request(
               "http://127.0.0.1:11235" + path, method=method,
               data=b"{}" if method == "POST" else None,
               headers={"Content-Type": "application/json"},
           )
           try:
-              print(urllib.request.urlopen(req, timeout=10).status)
+              got = urllib.request.urlopen(req, timeout=10).status
           except urllib.error.HTTPError as e:
-              print(e.code)
+              got = e.code
           except Exception as e:
-              print(type(e).__name__)
-          PY
+              print(f"{method} {path} -> {type(e).__name__}")
+              sys.exit(1)
+          print(f"{method} {path} -> {got} (expected {want})")
+          sys.exit(0 if got == want else 1)
+          CHK
           }
 
           wait_ready() {
             for _ in $(seq 1 60); do
-              if docker exec "$1" python3 -c \
-                'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:11235/health", timeout=2).status==200 else 1)' 2>/dev/null; then
+              if docker exec "$1" python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:11235/health", timeout=2).status==200 else 1)' 2>/dev/null; then
                 return 0
               fi
               sleep 2
@@ -250,20 +254,19 @@ jobs:
 
           fail() { echo "::error::$1"; exit 1; }
 
-          # No credential configured: the socket must stay on loopback, /token fails closed,
-          # and the MCP transports must not be reachable without a credential.
+          # No credential configured: loopback bind, /token fails closed, MCP unreachable.
           cid="$(docker run -d --name sync-no-credential crawl4ai-sync:validate)"
           wait_ready "${cid}" || fail "container without credentials never became healthy"
-          [ "$(status "${cid}" /health GET)" = "200" ] || fail "/health is not 200 without credentials"
-          [ "$(status "${cid}" /token POST)" = "403" ] || fail "/token did not fail closed without credentials"
-          [ "$(status "${cid}" /mcp/sse GET)" = "401" ] || fail "/mcp/sse is reachable without a credential"
-          docker logs "${cid}" 2>&1 | grep -a "binding loopback only" > /dev/null || fail "no-credential container did not report a loopback bind"
+          check "${cid}" /health GET 200 || fail "/health is not 200 without credentials"
+          check "${cid}" /token POST 403 || fail "/token did not fail closed without credentials"
+          check "${cid}" /mcp/sse GET 401 || fail "/mcp/sse is reachable without a credential"
+          docker logs "${cid}" 2>&1 | grep -a "binding loopback only" > /dev/null             || fail "no-credential container did not report a loopback bind"
           docker rm -f "${cid}" > /dev/null
 
-          # Credential configured: the socket may be exposed and /mcp stays gated.
+          # Credential configured: exposure allowed, MCP still gated.
           cid="$(docker run -d --name sync-with-token -e CRAWL4AI_API_TOKEN=sync-gate-token crawl4ai-sync:validate)"
           wait_ready "${cid}" || fail "container with a token never became healthy"
-          [ "$(status "${cid}" /mcp/sse GET)" = "401" ] || fail "/mcp/sse is reachable without a credential when a token is configured"
+          check "${cid}" /mcp/sse GET 401 || fail "/mcp/sse is reachable without a credential when a token is configured"
           docker rm -f "${cid}" > /dev/null
 
       - name: Resolve tag and release state
