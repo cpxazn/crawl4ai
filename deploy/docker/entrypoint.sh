@@ -28,13 +28,11 @@ if [[ -n "${CRAWL4AI_API_TOKEN:-}" || "${CRAWL4AI_JWT_ENABLED:-false}" == "true"
     # A credential is configured -> the operator may expose all interfaces.
     GUNICORN_BIND="${GUNICORN_BIND:-[::]:${PORT}}"
 else
-    # No credential -> default to loopback only. Set GUNICORN_BIND=0.0.0.0:PORT
-    # if you need Docker port mapping (the AuthGate still protects all routes).
-    GUNICORN_BIND="${GUNICORN_BIND:-127.0.0.1:${PORT}}"
-    if [[ "${GUNICORN_BIND}" == "127.0.0.1:${PORT}" ]]; then
-        echo "entrypoint: no CRAWL4AI_API_TOKEN set; binding loopback only (${GUNICORN_BIND})." >&2
-        echo "entrypoint: set GUNICORN_BIND=0.0.0.0:${PORT} if you need Docker port mapping." >&2
-    fi
+    # No credential -> refuse to expose; serve loopback only.
+    GUNICORN_BIND="127.0.0.1:${PORT}"
+    echo "entrypoint: no CRAWL4AI_API_TOKEN set; binding loopback only (${GUNICORN_BIND})." >&2
+    echo "entrypoint: WARNING: this is the CONTAINER's loopback - published ports (-p ${PORT}:${PORT}) will NOT work; connections from the host will be reset." >&2
+    echo "entrypoint: to make the server reachable, set CRAWL4AI_API_TOKEN (docker run -e CRAWL4AI_API_TOKEN=..., or 'export CRAWL4AI_API_TOKEN=...' before 'docker compose up'), then restart. (If you enabled security.jwt_enabled in a custom config.yml, set CRAWL4AI_JWT_ENABLED=true instead.)" >&2
 fi
 export GUNICORN_BIND
 

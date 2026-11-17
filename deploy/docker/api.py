@@ -23,7 +23,8 @@ from crawl4ai import (
     BrowserConfig,
     MemoryAdaptiveDispatcher,
     RateLimiter, 
-    LLMConfig
+    LLMConfig,
+    CrawlResult,
 )
 from crawl4ai.async_configs import Provenance, UntrustedConfigError
 from hook_registry import build_declarative_hooks, HookValidationError
@@ -69,6 +70,7 @@ from crawl4ai.content_filter_strategy import (
     BM25ContentFilter,
     LLMContentFilter
 )
+from crawl4ai.content_filter_strategy_lxml import PruningContentFilterLXML
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
@@ -85,6 +87,7 @@ from utils import (
     get_llm_base_url,
     get_redis_task_ttl,
     validate_url_destination,
+    datetime_handler,
 )
 from webhook import WebhookDeliveryService
 
@@ -93,6 +96,14 @@ import psutil, time
 logger = logging.getLogger(__name__)
 
 from fork_field_filter import _filter_result_fields  # noqa: E402 — fork addition
+
+
+def _raise_for_crawl_failure(result):
+    if not result.success:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.error_message,
+        )
 
 # --- Helper to get memory ---
 def _get_memory_mb():
@@ -149,11 +160,7 @@ async def handle_llm_qa(
         enforce_egress(browser_cfg)
         crawler = await get_crawler(browser_cfg)
         result = await crawler.arun(url)
-        if not result.success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
-            )
+        _raise_for_crawl_failure(result)
         content = result.markdown.fit_markdown or result.markdown.raw_markdown
 
         # Create prompt and get LLM response
@@ -181,6 +188,8 @@ async def handle_llm_qa(
         )
 
         return response.choices[0].message.content
+    except HTTPException:
+        raise
     except LLMProviderNotAllowed as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -356,7 +365,7 @@ async def handle_markdown_request(
             from llm_broker import resolve_llm
             _llm = resolve_llm(config, provider)
             content_filter = {
-                FilterType.FIT: PruningContentFilter(),
+                FilterType.FIT: PruningContentFilterLXML(),
                 FilterType.BM25: BM25ContentFilter(user_query=query or ""),
                 FilterType.LLM: LLMContentFilter(
                     llm_config=LLMConfig(
@@ -391,11 +400,7 @@ async def handle_markdown_request(
             )
         )
 
-        if not result.success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.error_message
-            )
+        _raise_for_crawl_failure(result)
 
         return (result.markdown.raw_markdown
                if filter_type == FilterType.RAW
@@ -601,11 +606,19 @@ def create_task_response(task: dict, task_id: str, base_url: str) -> dict:
 
     return response
 
+async def _dispose_crawler(crawler):
+    """Close a dedicated PDF crawler (not pooled) or release a pooled one."""
+    from crawl4ai.processors.pdf import PDFCrawlerStrategy
+    from crawler_pool import release_crawler
+    if isinstance(crawler.crawler_strategy, PDFCrawlerStrategy):
+        await crawler.close()
+    else:
+        await release_crawler(crawler)
+
 async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator, fields: Optional[List[str]] = None) -> AsyncGenerator[bytes, None]:
     """Stream results with heartbeats and completion markers."""
     import json
     from utils import datetime_handler
-    from crawler_pool import release_crawler
 
     try:
         async for result in results_gen:
@@ -631,21 +644,102 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator, 
 
         yield json.dumps({"status": "completed"}).encode('utf-8')
         
+    except asyncio.TimeoutError:
+        yield json.dumps({"status": "error", "error": "Crawl exceeded the time limit"}).encode('utf-8')
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
     finally:
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
 
 
-def _normalize_and_validate_seeds(urls: List[str]) -> List[str]:
+def _load_crawler_configs(
+    crawler_configs: List[dict],
+    base_config: Optional[dict] = None,
+    stream: bool = False,
+) -> List[CrawlerRunConfig]:
+    """Deserialize a per-URL crawler_configs list under the untrusted gate.
+    Shared by the streaming and non-streaming crawl handlers so both apply the
+    same boundary and wire the PDF URL validator into every entry."""
+    from crawl4ai.processors.pdf import PDFContentScrapingStrategy
+
+    config_list = [
+        CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED)
+        for cc in crawler_configs
+    ]
+    for cfg in config_list:
+        if cfg.deep_crawl_strategy is not None:
+            raise HTTPException(status_code=400, detail="Deep crawling supports exactly one URL per request.")
+        for key, value in (base_config or {}).items():
+            if hasattr(cfg, key):
+                current_value = getattr(cfg, key)
+                if current_value is None or current_value == "":
+                    setattr(cfg, key, value)
+        # SSRF: per-URL PDF strategies need the validator wired too
+        if isinstance(cfg.scraping_strategy, PDFContentScrapingStrategy):
+            cfg.scraping_strategy.url_validator = validate_url_destination
+        if stream:
+            # arun_many takes the stream flag from the first config of a list.
+            cfg.stream = True
+    return config_list
+
+
+def _needs_pdf_crawler(
+    crawler_config: CrawlerRunConfig,
+    config_list: Optional[List[CrawlerRunConfig]] = None,
+) -> bool:
+    """Whether the crawl runs on PDFCrawlerStrategy. A per-URL list decides when
+    present, since it is what arun_many runs. One crawler serves every URL of a
+    request, so a list mixing PDF and browser entries is refused rather than run
+    on the wrong one."""
+    from crawl4ai.processors.pdf import PDFContentScrapingStrategy
+
+    configs = config_list or [crawler_config]
+    pdf = [
+        isinstance(cfg.scraping_strategy, PDFContentScrapingStrategy) for cfg in configs
+    ]
+    if any(pdf) and not all(pdf):
+        raise HTTPException(
+            status_code=400,
+            detail="crawler_configs cannot mix PDFContentScrapingStrategy with other scraping strategies in one request",
+        )
+    return all(pdf)
+
+
+async def _with_deadline(gen: AsyncGenerator, seconds: float) -> AsyncGenerator:
+    """Stop a result stream once its wall-clock budget is spent (raises TimeoutError)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + seconds
+    try:
+        while True:
+            try:
+                yield await asyncio.wait_for(gen.__anext__(), max(end - loop.time(), 0))
+            except StopAsyncIteration:
+                return
+    finally:
+        await gen.aclose()
+
+
+def _normalize_and_validate_seeds(urls: List[str]) -> Tuple[List[str], List[CrawlResult]]:
     """Prefix bare hosts with https:// and SSRF-validate every seed URL's
     destination. Shared by the streaming and non-streaming crawl handlers so a
-    new entry point cannot silently skip the destination check."""
+    new entry point cannot silently skip the destination check.
+
+    Returns (allowed, refused): a refused seed becomes a failed CrawlResult so
+    one bad seed does not sink the batch. If no seed is allowed, the first
+    refusal is raised (400), as before."""
     urls = [('https://' + url) if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")) else url for url in urls]
+    allowed, refused, first_error = [], [], None
     for url in urls:
-        validate_url_destination(url)
-    return urls
+        try:
+            validate_url_destination(url)
+            allowed.append(url)
+        except HTTPException as e:
+            first_error = first_error or e
+            refused.append(CrawlResult(url=url, html="", success=False, error_message=e.detail))
+    if first_error and not allowed:
+        raise first_error
+    return allowed, refused
 
 
 async def handle_crawl_request(
@@ -661,6 +755,7 @@ async def handle_crawl_request(
     # Track request start
     request_id = f"req_{uuid4().hex[:8]}"
     crawler = None
+    is_pdf_crawl = False
     try:
         from monitor import get_monitor
         await get_monitor().track_request_start(
@@ -675,13 +770,15 @@ async def handle_crawl_request(
     peak_mem_mb = start_mem_mb
 
     try:
-        urls = _normalize_and_validate_seeds(urls)
+        urls, refused = _normalize_and_validate_seeds(urls)
         browser_config = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
         crawler_config = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
-        from governor import clamp_deep_crawl
-        clamp_deep_crawl(crawler_config)
+        from governor import clamp_deep_crawl, deep_crawl_limits
+        clamp_deep_crawl(crawler_config, **deep_crawl_limits(config))
+        if crawler_config.deep_crawl_strategy is not None and len(urls) + len(refused) != 1:
+            raise HTTPException(status_code=400, detail="Deep crawling supports exactly one URL per request.")
 
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
@@ -690,27 +787,39 @@ async def handle_crawl_request(
             ) if config["crawler"]["rate_limiter"]["enabled"] else None
         )
         
+        base_config = config["crawler"]["base_config"]
+        # Per-URL config list: deserialize each and apply base_config. Loaded
+        # before a crawler is chosen, because the list decides which one runs.
+        config_list = (
+            _load_crawler_configs(crawler_configs, base_config)
+            if crawler_configs
+            else None
+        )
+
         from crawler_pool import get_crawler, release_crawler
-        crawler = await get_crawler(browser_config)
-        
+        from crawl4ai.processors.pdf import PDFContentScrapingStrategy, PDFCrawlerStrategy
+        is_pdf_crawl = _needs_pdf_crawler(crawler_config, config_list)
+        if is_pdf_crawl:
+            if hooks_config:
+                # PDFCrawlerStrategy has no browser page, so hooks can't attach to it
+                raise HTTPException(status_code=400, detail="Hooks are not supported with PDFContentScrapingStrategy")
+            # SSRF protection: vet the PDF download URL and every redirect hop
+            if isinstance(crawler_config.scraping_strategy, PDFContentScrapingStrategy):
+                crawler_config.scraping_strategy.url_validator = validate_url_destination
+            # Use PDFCrawlerStrategy when scraping PDFs, as headless Chromium can't render PDFs inline
+            crawler = AsyncWebCrawler(crawler_strategy=PDFCrawlerStrategy())
+            await crawler.start()
+        else:
+            crawler = await get_crawler(browser_config)
+
         # Attach declarative hooks if provided
         hooks_status = {}
         if hooks_config:
             hooks_status = _attach_declarative_hooks(crawler, hooks_config)
             logger.info(f"Hooks attachment status: {hooks_status['status']}")
-        
-        base_config = config["crawler"]["base_config"]
 
         # Build the config(s) to pass to arun/arun_many
-        if crawler_configs and len(urls) > 1:
-            # Per-URL config list: deserialize each and apply base_config
-            config_list = [CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED) for cc in crawler_configs]
-            for cfg in config_list:
-                for key, value in base_config.items():
-                    if hasattr(cfg, key):
-                        current_value = getattr(cfg, key)
-                        if current_value is None or current_value == "":
-                            setattr(cfg, key, value)
+        if config_list:
             effective_config = config_list
         else:
             # Single config (original behavior)
@@ -722,9 +831,12 @@ async def handle_crawl_request(
             effective_config = crawler_config
 
         results = []
-        func = getattr(crawler, "arun" if len(urls) == 1 else "arun_many")
+        # arun takes one config, so a per-URL list goes to arun_many even for
+        # a single URL; arun_many matches each URL against the list.
+        use_many = len(urls) > 1 or isinstance(effective_config, list)
+        func = getattr(crawler, "arun_many" if use_many else "arun")
         partial_func = partial(func,
-                                urls[0] if len(urls) == 1 else urls,
+                                urls if use_many else urls[0],
                                 config=effective_config,
                                 dispatcher=dispatcher)
         # Optional per-crawl wall-clock deadline (config limits.wall_clock_s; 0 = none).
@@ -738,6 +850,7 @@ async def handle_crawl_request(
         # Ensure results is always a list
         if not isinstance(results, list):
             results = [results]
+        results = refused + results
 
         end_mem_mb = _get_memory_mb() # <--- Get memory after
         end_time = time.time()
@@ -773,9 +886,12 @@ async def handle_crawl_request(
                 if result_dict.get('pdf') is not None and isinstance(result_dict.get('pdf'), bytes):
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
                     
-                # Filter to only requested fields
+                if is_pdf_crawl:
+                    # PDF metadata contains datetimes that JSONResponse can't serialize
+                    result_dict = json.loads(json.dumps(result_dict, default=datetime_handler))
+
+                # Filter to only requested fields (fork addition)
                 result_dict = _filter_result_fields(result_dict, fields)
-                    
                 processed_results.append(result_dict)
             except Exception as e:
                 logger.error(f"Error processing result: {e}")
@@ -856,14 +972,24 @@ async def handle_crawl_request(
         )
     finally:
         if crawler:
-            await release_crawler(crawler)
+            if is_pdf_crawl:
+                await crawler.close()  # not pooled; release_crawler would be a no-op
+            else:
+                await release_crawler(crawler)
+
+async def _prepend_results(first: List[CrawlResult], results_gen: AsyncGenerator) -> AsyncGenerator:
+    for result in first:
+        yield result
+    async for result in results_gen:
+        yield result
 
 async def handle_stream_crawl_request(
     urls: List[str],
     browser_config: dict,
     crawler_config: dict,
     config: dict,
-    hooks_config: Optional[dict] = None
+    hooks_config: Optional[dict] = None,
+    crawler_configs: Optional[List[dict]] = None,
 ) -> Tuple[AsyncWebCrawler, AsyncGenerator, Optional[Dict]]:
     """Handle streaming crawl requests with optional hooks."""
     hooks_info = None
@@ -872,30 +998,54 @@ async def handle_stream_crawl_request(
         # SSRF guard: validate every seed URL's destination before fetching,
         # mirroring handle_crawl_request. The streaming path previously skipped
         # this, leaving /crawl/stream (and /crawl with stream=true) unguarded.
-        urls = _normalize_and_validate_seeds(urls)
-        browser_config = BrowserConfig.load(browser_config, provenance=Provenance.UNTRUSTED)
+        urls, refused = _normalize_and_validate_seeds(urls)
+        browser_config = BrowserConfig.load(
+            browser_config, provenance=Provenance.UNTRUSTED
+        )
         # browser_config.verbose = True # Set to False or remove for production stress testing
         browser_config.verbose = False
         from egress_broker import enforce_egress
+
         enforce_egress(browser_config)
-        crawler_config = CrawlerRunConfig.load(crawler_config, provenance=Provenance.UNTRUSTED)
-        from governor import clamp_deep_crawl
-        clamp_deep_crawl(crawler_config)
-        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
+        crawler_config = CrawlerRunConfig.load(
+            crawler_config, provenance=Provenance.UNTRUSTED
+        )
+        from governor import clamp_deep_crawl, deep_crawl_limits
+
+        clamp_deep_crawl(crawler_config, **deep_crawl_limits(config))
         crawler_config.stream = True
+        config_list = (
+            _load_crawler_configs(
+                crawler_configs, config["crawler"]["base_config"], stream=True
+            )
+            if crawler_configs
+            else None
+        )
 
         # Deep crawl streaming supports exactly one start URL
-        if crawler_config.deep_crawl_strategy is not None and len(urls) != 1:
+        if crawler_config.deep_crawl_strategy is not None and len(urls) + len(refused) != 1:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "Deep crawling with stream currently supports exactly one URL per request. "
-                    f"Received {len(urls)} URLs."
+                    f"Received {len(urls) + len(refused)} URLs."
                 ),
             )
 
-        from crawler_pool import get_crawler, release_crawler
-        crawler = await get_crawler(browser_config)
+        from crawler_pool import get_crawler
+        from crawl4ai.processors.pdf import PDFContentScrapingStrategy, PDFCrawlerStrategy
+        if _needs_pdf_crawler(crawler_config, config_list):
+            if hooks_config:
+                # PDFCrawlerStrategy has no browser page, so hooks can't attach to it
+                raise HTTPException(status_code=400, detail="Hooks are not supported with PDFContentScrapingStrategy")
+            # SSRF protection: vet the PDF download URL and every redirect hop
+            if isinstance(crawler_config.scraping_strategy, PDFContentScrapingStrategy):
+                crawler_config.scraping_strategy.url_validator = validate_url_destination
+            # Use PDFCrawlerStrategy when scraping PDFs, as headless Chromium can't render PDFs inline
+            crawler = AsyncWebCrawler(crawler_strategy=PDFCrawlerStrategy())
+            await crawler.start()
+        else:
+            crawler = await get_crawler(browser_config)
 
         # Attach declarative hooks if provided
         if hooks_config:
@@ -910,6 +1060,9 @@ async def handle_stream_crawl_request(
                 urls[0],
                 config=crawler_config,
             )
+            from governor import wall_clock_seconds
+            if wall_clock_seconds(config) > 0:
+                results_gen = _with_deadline(results_gen, wall_clock_seconds(config))
         else:
             # Default multi-URL streaming via arun_many
             dispatcher = MemoryAdaptiveDispatcher(
@@ -920,36 +1073,39 @@ async def handle_stream_crawl_request(
             )
             results_gen = await crawler.arun_many(
                 urls=urls,
-                config=crawler_config,
+                config=config_list or crawler_config,
                 dispatcher=dispatcher
             )
+
+        if refused:
+            results_gen = _prepend_results(refused, results_gen)
 
         return crawler, results_gen, hooks_info
 
     except (UntrustedConfigError, HookValidationError) as e:
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
         raise HTTPException(status_code=400, detail=f"Rejected request: {e}")
 
     except HTTPException:
         # Deliberate status (e.g. 400 SSRF "URL blocked") must pass through
         # rather than be genericized to 500 by the handler below.
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
         raise
 
     except Exception as e:
-        # Release crawler on setup error (for successful streams,
-        # release happens in stream_results finally block)
+        # Dispose crawler on setup error (for successful streams,
+        # disposal happens in stream_results finally block)
         if crawler:
-            await release_crawler(crawler)
+            await _dispose_crawler(crawler)
         logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
         # Raising HTTPException here will prevent streaming response
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
-        
+
 async def handle_crawl_job(
     redis,
     background_tasks: BackgroundTasks,
