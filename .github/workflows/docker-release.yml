@@ -10,6 +10,15 @@ on:
     tags:
       - 'docker-rebuild-v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. sync-<sha>); used as the image version"
+        type: string
+        required: false
+      ref:
+        description: "Commit SHA to build"
+        type: string
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,6 +36,8 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Extract version from release or rebuild tag
         id: version
@@ -37,7 +48,13 @@ jobs:
           version=""
           publish_latest="false"
 
-          if [ "${{ github.event_name }}" = "release" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            version="${{ inputs.tag }}"
+            version="${version#v}"
+            if [[ "${version}" != *-* ]]; then
+              publish_latest="true"
+            fi
+          elif [ "${{ github.event_name }}" = "release" ]; then
             version="${{ github.event.release.tag_name }}"
             version="${version#v}"
             if [ "${{ github.event.release.prerelease }}" != "true" ]; then

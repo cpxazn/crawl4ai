@@ -4,9 +4,23 @@ on:
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate only: never push, tag, release or dispatch"
+        type: boolean
+        default: false
+      sync_branch:
+        description: "Branch to merge into and push"
+        type: string
+        default: main
+      build_image:
+        description: "Build the Docker image and assert its auth posture (slow)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -15,123 +29,354 @@ concurrency:
 env:
   UPSTREAM_REPO: https://github.com/unclecode/crawl4ai.git
   UPSTREAM_BRANCH: main
-  TARGET_BRANCH: main
 
 jobs:
-  sync-upstream:
+  sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
 
     steps:
-      - name: Checkout fork branch
+      - name: Checkout the sync branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.TARGET_BRANCH }}
+          ref: ${{ inputs.sync_branch || 'main' }}
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN || github.token }}
 
       - name: Configure git
+        env:
+          SYNC_BRANCH: ${{ inputs.sync_branch || 'main' }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local advice.detachedHead false
+          echo "SYNC_BRANCH=${SYNC_BRANCH}" >> "$GITHUB_ENV"
 
       - name: Fetch origin and upstream
         run: |
-          git remote remove upstream || true
-          git remote add upstream "${UPSTREAM_REPO}"
+          set -euo pipefail
+          git remote set-url upstream "${UPSTREAM_REPO}" 2>/dev/null || git remote add upstream "${UPSTREAM_REPO}"
           git fetch --prune origin
           git fetch --prune upstream "${UPSTREAM_BRANCH}"
 
-      - name: Detect upstream changes
-        id: detect
-        shell: bash
+      - name: Align HEAD with the fetched branch tip
         run: |
           set -euo pipefail
-
-          upstream_ref="upstream/${UPSTREAM_BRANCH}"
-          target_ref="origin/${TARGET_BRANCH}"
-          merge_base="$(git merge-base "${target_ref}" "${upstream_ref}")"
-          upstream_ahead_count="$(git rev-list --count "${merge_base}..${upstream_ref}")"
-
-          echo "merge_base=${merge_base}" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$(git rev-parse "${upstream_ref}")" >> "$GITHUB_OUTPUT"
-          echo "target_sha=$(git rev-parse "${target_ref}")" >> "$GITHUB_OUTPUT"
-          echo "upstream_ahead_count=${upstream_ahead_count}" >> "$GITHUB_OUTPUT"
-
-          if [ "${upstream_ahead_count}" = "0" ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream changes detected."
+          if git rev-parse --verify --quiet "origin/${SYNC_BRANCH}" > /dev/null; then
+            git checkout -B "${SYNC_BRANCH}" "origin/${SYNC_BRANCH}"
           else
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream is ahead by ${upstream_ahead_count} commit(s)."
+            echo "::error::origin/${SYNC_BRANCH} does not exist; refusing to invent a branch."
+            exit 1
           fi
 
-      - name: Rebase fork branch onto upstream
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          set -euo pipefail
+          upstream_ref="upstream/${UPSTREAM_BRANCH}"
+          target_ref="origin/${SYNC_BRANCH}"
+          merge_base="$(git merge-base "${target_ref}" "${upstream_ref}")"
+          upstream_sha="$(git rev-parse "${upstream_ref}")"
+          target_sha="$(git rev-parse "${target_ref}")"
+          ahead="$(git rev-list --count "${merge_base}..${upstream_ref}")"
+
+          {
+            echo "merge_base=${merge_base}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "target_sha=${target_sha}"
+            echo "upstream_ahead_count=${ahead}"
+            echo "tag=sync-${upstream_sha}"
+            if [ "${ahead}" = "0" ]; then echo "has_changes=false"; else echo "has_changes=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Upstream ${upstream_sha} is ${ahead} commit(s) ahead of the merge base." \
+            "Target branch is at ${target_sha}."
+
+      - name: Merge upstream into the sync branch
+        id: merge
         if: steps.detect.outputs.has_changes == 'true'
-        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.detect.outputs.upstream_sha }}
         run: |
           set -euo pipefail
 
-          git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
-          git rebase "upstream/${UPSTREAM_BRANCH}"
-          git push origin "${TARGET_BRANCH}" --force-with-lease
+          # Files whose content is regenerated rather than authored. A conflict in one of
+          # these may be resolved by taking upstream and rebuilding. Everything else is
+          # source: the run aborts and pushes nothing, because guessing semantics in a
+          # conflict is how a fork silently loses its own behaviour.
+          ALLOWLIST='^(themes|assets)/|\.lock$|^uv\.lock$|^package-lock\.json$'
 
-      - name: Create sync tag
-        if: steps.detect.outputs.has_changes == 'true'
-        id: tag
-        shell: bash
+          if ! git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            echo "Conflicting paths (${#conflicts[@]}):" \
+              && printf '  %s\n' "${conflicts[@]}"
+
+            unexpected=()
+            for path in "${conflicts[@]}"; do
+              [[ "${path}" =~ ${ALLOWLIST} ]] || unexpected+=("${path}")
+            done
+
+            if [ "${#unexpected[@]}" -gt 0 ]; then
+              git merge --abort
+              {
+                echo "## Upstream sync blocked by source conflicts"
+                echo ""
+                echo "Upstream: \`${UPSTREAM_SHA}\`"
+                echo ""
+                echo "Nothing was pushed. Resolve these by hand, or extend the allowlist if the"
+                echo "file really is regenerated output:"
+                echo ""
+                printf -- "- \`%s\`\n" "${unexpected[@]}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::${#unexpected[@]} conflicted path(s) are outside the auto-resolve allowlist."
+              exit 1
+            fi
+
+            for path in "${conflicts[@]}"; do
+              git checkout --theirs -- "${path}"
+              git add -- "${path}"
+            done
+            echo "auto_resolved=$(printf '%s,' "${conflicts[@]}")" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "::error::the merge produced no changes despite upstream being ahead."
+            exit 1
+          fi
+
+          git commit -m "merge: upstream ${UPSTREAM_SHA}" \
+                     -m "Automated sync of ${UPSTREAM_REPO} ${UPSTREAM_BRANCH}."
+          echo "merge_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether validation is required
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.has_changes }}" = "true" ] || [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.plan.outputs.build_needed == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e .
+          python -m pip install --quiet -r deploy/docker/requirements.txt
+          python -m pip install --quiet pytest pyjwt pytest-asyncio "pydantic[email]" build
+
+      - name: Compile and import the Docker server
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          python -m compileall -q deploy/docker
+          ( cd deploy/docker && python -c "import server; print('server import ok:', type(server.app).__name__)" )
+
+      - name: Build the wheel and sdist
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          python -m build
+          ls -l dist
+
+      - name: "Behavioural gate: docker server test suites"
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          # test_monitor_demo.py expects a live server and fails identically on fork and
+          # upstream today; it is the only exclusion. test_1..test_7 drive a running
+          # container with curl-style scripts and are not pytest suites.
+          pytest deploy/docker/tests -q -p no:cacheprovider -o asyncio_mode=auto \
+            --ignore=deploy/docker/tests/test_monitor_demo.py \
+            --ignore=deploy/docker/tests/test_1_basic.py \
+            --ignore=deploy/docker/tests/test_2_memory.py \
+            --ignore=deploy/docker/tests/test_3_pool.py \
+            --ignore=deploy/docker/tests/test_4_concurrent.py \
+            --ignore=deploy/docker/tests/test_5_pool_stress.py \
+            --ignore=deploy/docker/tests/test_6_multi_endpoint.py \
+            --ignore=deploy/docker/tests/test_7_cleanup.py
+
+      - name: Build the published image
+        if: steps.plan.outputs.build_needed == 'true' && inputs.build_image
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile -t crawl4ai-sync:validate . 2>&1 | tail -25
+
+      - name: Assert the image installed this tree and enforces its auth posture
+        if: steps.plan.outputs.build_needed == 'true' && inputs.build_image
         run: |
           set -euo pipefail
 
-          short_sha="${{ steps.detect.outputs.upstream_sha }}"
-          short_sha="${short_sha:0:7}"
-          date_tag="$(date -u +%Y%m%d)"
-          tag="sync-${date_tag}-${short_sha}-${GITHUB_RUN_NUMBER}"
-          feature_head="$(git rev-parse HEAD)"
+          installed="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,os;print(os.path.realpath(crawl4ai.__file__))')"
+          echo "image installed crawl4ai from: ${installed}"
 
-          git tag "${tag}" "${feature_head}"
-          git push origin "${tag}"
+          status() {  # status <container> <path> <method>
+            docker exec "$1" python3 - "$2" "$3" <<'PY'
+          import sys, urllib.request, urllib.error
+          path, method = sys.argv[1], sys.argv[2]
+          req = urllib.request.Request(
+              "http://127.0.0.1:11235" + path, method=method,
+              data=b"{}" if method == "POST" else None,
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=10).status)
+          except urllib.error.HTTPError as e:
+              print(e.code)
+          except Exception as e:
+              print(type(e).__name__)
+          PY
+          }
 
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "feature_head=${feature_head}" >> "$GITHUB_OUTPUT"
+          wait_ready() {
+            for _ in $(seq 1 60); do
+              if docker exec "$1" python3 -c \
+                'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:11235/health", timeout=2).status==200 else 1)' 2>/dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            docker logs "$1" | tail -30
+            return 1
+          }
 
-      - name: Create GitHub release
+          fail() { echo "::error::$1"; exit 1; }
+
+          # No credential configured: the socket must stay on loopback, /token fails closed,
+          # and the MCP transports must not be reachable without a credential.
+          cid="$(docker run -d --name sync-no-credential crawl4ai-sync:validate)"
+          wait_ready "${cid}" || fail "container without credentials never became healthy"
+          [ "$(status "${cid}" /health GET)" = "200" ] || fail "/health is not 200 without credentials"
+          [ "$(status "${cid}" /token POST)" = "403" ] || fail "/token did not fail closed without credentials"
+          [ "$(status "${cid}" /mcp/sse GET)" = "401" ] || fail "/mcp/sse is reachable without a credential"
+          docker logs "${cid}" 2>&1 | grep -a "binding loopback only" > /dev/null || fail "no-credential container did not report a loopback bind"
+          docker rm -f "${cid}" > /dev/null
+
+          # Credential configured: the socket may be exposed and /mcp stays gated.
+          cid="$(docker run -d --name sync-with-token -e CRAWL4AI_API_TOKEN=sync-gate-token crawl4ai-sync:validate)"
+          wait_ready "${cid}" || fail "container with a token never became healthy"
+          [ "$(status "${cid}" /mcp/sse GET)" = "401" ] || fail "/mcp/sse is reachable without a credential when a token is configured"
+          docker rm -f "${cid}" > /dev/null
+
+      - name: Resolve tag and release state
+        id: state
         if: steps.detect.outputs.has_changes == 'true'
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+
+          remote_tag_sha="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
+          if [ -n "${remote_tag_sha}" ]; then
+            tag_exists=true
+            if [ "${remote_tag_sha}" != "${head_sha}" ]; then
+              echo "::error::tag ${TAG} already points at ${remote_tag_sha}, not ${head_sha}; refusing to move or reuse it."
+              exit 1
+            fi
+            tag_matches=true
+          else
+            tag_exists=false
+            tag_matches=false
+          fi
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            release_exists=true
+          else
+            release_exists=false
+          fi
+
+          {
+            echo "head_sha=${head_sha}"
+            echo "tag_exists=${tag_exists}"
+            echo "tag_matches=${tag_matches}"
+            echo "release_exists=${release_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push the sync branch
+        if: steps.detect.outputs.has_changes == 'true' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          # No --force: a concurrent advance must fail the run, not be overwritten.
+          git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+      - name: Create the sync tag
+        if: steps.state.outputs.tag_exists == 'false' && inputs.dry_run != true
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "${TAG}" "${{ steps.state.outputs.head_sha }}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Create the GitHub release
+        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Sync ${{ steps.tag.outputs.tag }}
-          target_commitish: ${{ steps.tag.outputs.feature_head }}
+          tag_name: ${{ steps.detect.outputs.tag }}
+          target_commitish: ${{ steps.state.outputs.head_sha }}
+          name: Sync ${{ steps.detect.outputs.tag }}
           generate_release_notes: true
           body: |
-            Automated upstream sync for Docker publishing.
+            Automated upstream sync.
 
-            - Upstream repo: ${{ env.UPSTREAM_REPO }}
-            - Upstream branch: ${{ env.UPSTREAM_BRANCH }}
-            - Target branch before rebase: ${{ steps.detect.outputs.target_sha }}
-            - Merge base before rebase: ${{ steps.detect.outputs.merge_base }}
-            - New upstream HEAD: ${{ steps.detect.outputs.upstream_sha }}
-            - Upstream commits ahead: ${{ steps.detect.outputs.upstream_ahead_count }}
-            - Synced fork HEAD: ${{ steps.tag.outputs.feature_head }}
+            - Upstream: `${{ env.UPSTREAM_REPO }}` (`${{ env.UPSTREAM_BRANCH }}`)
+            - Upstream commit: `${{ steps.detect.outputs.upstream_sha }}`
+            - Merge base before sync: `${{ steps.detect.outputs.merge_base }}`
+            - Upstream commits merged: ${{ steps.detect.outputs.upstream_ahead_count }}
+            - Synced commit (validated before push): `${{ steps.state.outputs.head_sha }}`
+          # github.token by design: this release must not fire the release-triggered
+          # Docker workflow, which is dispatched explicitly below so it always builds
+          # the commit this run validated.
+          token: ${{ github.token }}
+
+      - name: Publish the Docker image for this tag
+        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
-
-      - name: No changes to sync
-        if: steps.detect.outputs.has_changes != 'true'
-        run: echo "Nothing to sync."
-
-      - name: Write job summary
-        shell: bash
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          TAG: ${{ steps.detect.outputs.tag }}
+          SHA: ${{ steps.state.outputs.head_sha }}
         run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
+          fi
+          gh workflow run docker-release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${SYNC_BRANCH}" \
+            -f tag="${TAG}" \
+            -f ref="${SHA}"
+          sleep 10
+          gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml --limit 5 \
+            --json databaseId,event,status,headBranch,displayTitle \
+            --jq '.[] | "\(.databaseId) \(.event) \(.status) \(.displayTitle)"'
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -euo pipefail
           {
-            echo "## Upstream Sync"
+            echo "## Upstream sync"
             echo ""
-            echo "- Upstream repo: ${UPSTREAM_REPO}"
-            echo "- Upstream branch: ${UPSTREAM_BRANCH}"
-            echo "- Target branch: ${TARGET_BRANCH}"
-            echo "- Previous fork HEAD: ${{ steps.detect.outputs.target_sha }}"
-            echo "- Merge base: ${{ steps.detect.outputs.merge_base }}"
-            echo "- Upstream HEAD: ${{ steps.detect.outputs.upstream_sha }}"
-            echo "- Upstream commits ahead: ${{ steps.detect.outputs.upstream_ahead_count }}"
-            echo "- Sync performed: ${{ steps.detect.outputs.has_changes }}"
-            echo "- Release tag: ${{ steps.tag.outputs.tag }}"
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| branch | \`${SYNC_BRANCH}\` |"
+            echo "| dry run | ${{ inputs.dry_run }} |"
+            echo "| upstream head | \`${{ steps.detect.outputs.upstream_sha }}\` |"
+            echo "| merge base | \`${{ steps.detect.outputs.merge_base }}\` |"
+            echo "| upstream ahead | ${{ steps.detect.outputs.upstream_ahead_count }} |"
+            echo "| changes | ${{ steps.detect.outputs.has_changes }} |"
+            echo "| merge commit | \`${{ steps.state.outputs.head_sha }}\` |"
+            echo "| tag | \`${{ steps.detect.outputs.tag }}\` |"
+            echo "| tag existed | ${{ steps.state.outputs.tag_exists }} |"
+            echo "| release existed | ${{ steps.state.outputs.release_exists }} |"
+            echo "| validation ran | ${{ steps.plan.outputs.build_needed }} |"
           } >> "$GITHUB_STEP_SUMMARY"
