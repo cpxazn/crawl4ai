@@ -71,11 +71,14 @@ jobs:
           repo="${INPUT_UPSTREAM_REPO:-$UPSTREAM_REPO}"
           branch="${INPUT_UPSTREAM_BRANCH:-$UPSTREAM_BRANCH}"
           echo "UPSTREAM_REPO_ACTUAL=${repo}" >> "$GITHUB_ENV"
-                    echo "UPSTREAM_BRANCH_ACTUAL=${branch}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BRANCH_ACTUAL=${branch}" >> "$GITHUB_ENV"
           echo "fetching upstream from ${repo} (${branch})"
-          git remote set-url upstream "${repo}" 2>/dev/null || git remote add upstream "${repo}"
           git fetch --prune origin
-          git fetch --prune upstream "${branch}"
+          # Fetch upstream anonymously into refs/remotes/upstream/<branch>. actions/checkout
+          # injects this repository's credential as an http.extraheader, and reusing it against a
+          # foreign URL fails with 403, so the header is cleared for this one command. Upstream is
+          # public, so no credential is needed and the credential is never sent to a third party.
+          GIT_TERMINAL_PROMPT=0 git -c "http.https://github.com/.extraheader=" fetch --prune "${repo}" "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
 
       - name: Align HEAD with the fetched branch tip
         run: |
