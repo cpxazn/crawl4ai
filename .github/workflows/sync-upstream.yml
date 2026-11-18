@@ -489,7 +489,11 @@ jobs:
       - name: Publish and verify the Docker image for this tag
         if: inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          # github.token on purpose: dispatching a workflow needs the actions:write
+          # permission this workflow declares, and a classic PAT without the `workflow`
+          # scope is rejected with HTTP 403 "Resource not accessible by personal access
+          # token". workflow_dispatch is one of the two events GITHUB_TOKEN may trigger.
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.detect.outputs.tag }}
           SHA: ${{ steps.state.outputs.head_sha }}
         run: |
@@ -532,9 +536,10 @@ jobs:
             before_ids="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml     --limit 50 --json databaseId --jq '.[].databaseId' | tr '
           ' ' ')"
             if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
-              echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
+              echo "debug::PAT_TOKEN not set; dispatch uses github.token."
             fi
-            gh workflow run docker-release.yml     --repo "${GITHUB_REPOSITORY}"     --ref "${SYNC_BRANCH}"     -f tag="${TAG}"     -f ref="${SHA}"
+            gh workflow run docker-release.yml     --repo "${GITHUB_REPOSITORY}"     --ref "${SYNC_BRANCH}"     -f tag="${TAG}"     -f ref="${SHA}" \
+              || { echo "::error::could not dispatch docker-release.yml. GITHUB_TOKEN needs actions:write; a PAT needs the workflow scope."; exit 1; }
             for _ in $(seq 1 40); do
               sleep 10
               candidate="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml       --limit 50 --json databaseId,displayTitle       --jq "[.[] | select(.displayTitle == \"docker ${TAG}\")][0].databaseId // empty")"
