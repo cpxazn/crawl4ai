@@ -96,17 +96,19 @@ jobs:
 
           if [ -n "${version}" ]; then
             major="${version%%.*}"
-            rest="${version#${major}.}"
+            rest="${version#"${major}".}"
             if [ "${rest}" != "${version}" ]; then
               minor_component="${rest%%.*}"
               major_minor="${major}.${minor_component}"
             else
               major_minor=""
             fi
-            echo "has_version=true" >> "$GITHUB_OUTPUT"
-            echo "version=${version}" >> "$GITHUB_OUTPUT"
-            echo "major=${major}" >> "$GITHUB_OUTPUT"
-            echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
+            {
+              echo "has_version=true"
+              echo "version=${version}"
+              echo "major=${major}"
+              echo "major_minor=${major_minor}"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "has_version=false" >> "$GITHUB_OUTPUT"
           fi

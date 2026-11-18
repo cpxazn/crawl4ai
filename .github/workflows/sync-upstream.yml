@@ -154,7 +154,10 @@ jobs:
               echo "Nothing was pushed, tagged or released. Resolve these by hand on the"
               echo "fork, then re-run this workflow:"
               echo ""
-              printf -- '- `%s`\n' "${conflicts[@]}"
+              for conflict in "${conflicts[@]}"; do
+                # 140 is a backtick; writing it literally inside quotes trips shellcheck SC2016.
+                printf -- '- \140%s\140\n' "${conflict}"
+              done
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error::merge conflicted on ${#conflicts[@]} path(s); see the job summary. Nothing was pushed."
             exit 1
