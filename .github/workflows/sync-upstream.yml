@@ -14,7 +14,7 @@ on:
         type: string
         default: main
       build_image:
-        description: "Build the Docker image and assert its auth posture (slow)"
+        description: "Deprecated: image validation always runs now. Kept so old invocations do not fail."
         type: boolean
         default: true
 
@@ -72,6 +72,8 @@ jobs:
 
       - name: Detect upstream changes
         id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           upstream_ref="upstream/${UPSTREAM_BRANCH}"
@@ -80,18 +82,35 @@ jobs:
           upstream_sha="$(git rev-parse "${upstream_ref}")"
           target_sha="$(git rev-parse "${target_ref}")"
           ahead="$(git rev-list --count "${merge_base}..${upstream_ref}")"
+          tag="sync-${upstream_sha}"
+
+          # Publication state is resolved here, before any validation, so a run that
+          # finds nothing new to merge but a missing tag/release still validates the
+          # tree before publishing instead of skipping every gate.
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${tag}" | awk '{print $1}')" ]; then
+            tag_exists=true
+          else
+            tag_exists=false
+          fi
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            release_exists=true
+          else
+            release_exists=false
+          fi
 
           {
             echo "merge_base=${merge_base}"
             echo "upstream_sha=${upstream_sha}"
             echo "target_sha=${target_sha}"
             echo "upstream_ahead_count=${ahead}"
-            echo "tag=sync-${upstream_sha}"
+            echo "tag=${tag}"
+            echo "tag_exists=${tag_exists}"
+            echo "release_exists=${release_exists}"
             if [ "${ahead}" = "0" ]; then echo "has_changes=false"; else echo "has_changes=true"; fi
           } >> "$GITHUB_OUTPUT"
 
           echo "Upstream ${upstream_sha} is ${ahead} commit(s) ahead of the merge base." \
-            "Target branch is at ${target_sha}."
+            "Target branch is at ${target_sha}. tag_exists=${tag_exists} release_exists=${release_exists}."
 
       - name: Merge upstream into the sync branch
         id: merge
@@ -101,43 +120,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Files whose content is regenerated rather than authored. A conflict in one of
-          # these may be resolved by taking upstream and rebuilding. Everything else is
-          # source: the run aborts and pushes nothing, because guessing semantics in a
-          # conflict is how a fork silently loses its own behaviour.
-          ALLOWLIST='^(themes|assets)/|\.lock$|^uv\.lock$|^package-lock\.json$'
+          # No auto-resolution. Every file upstream touches here is hand-written
+          # source, and guessing semantics inside a conflict is exactly how a fork
+          # silently loses its own behaviour. Any conflict at all aborts the run and
+          # nothing is pushed, tagged or released.
 
           if ! git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"; then
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
-            echo "Conflicting paths (${#conflicts[@]}):" \
-              && printf '  %s\n' "${conflicts[@]}"
-
-            unexpected=()
-            for path in "${conflicts[@]}"; do
-              [[ "${path}" =~ ${ALLOWLIST} ]] || unexpected+=("${path}")
-            done
-
-            if [ "${#unexpected[@]}" -gt 0 ]; then
-              git merge --abort
-              {
-                echo "## Upstream sync blocked by source conflicts"
-                echo ""
-                echo "Upstream: \`${UPSTREAM_SHA}\`"
-                echo ""
-                echo "Nothing was pushed. Resolve these by hand, or extend the allowlist if the"
-                echo "file really is regenerated output:"
-                echo ""
-                printf -- "- \`%s\`\n" "${unexpected[@]}"
-              } >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::${#unexpected[@]} conflicted path(s) are outside the auto-resolve allowlist."
-              exit 1
-            fi
-
-            for path in "${conflicts[@]}"; do
-              git checkout --theirs -- "${path}"
-              git add -- "${path}"
-            done
-            echo "auto_resolved=$(printf '%s,' "${conflicts[@]}")" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+            {
+              echo "## Upstream sync blocked by merge conflicts"
+              echo ""
+              echo "Upstream: \`${UPSTREAM_SHA}\`"
+              echo ""
+              echo "Nothing was pushed, tagged or released. Resolve these by hand on the"
+              echo "fork, then re-run this workflow:"
+              echo ""
+              printf -- '- `%s`\n' "${conflicts[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::merge conflicted on ${#conflicts[@]} path(s); see the job summary. Nothing was pushed."
+            exit 1
           fi
 
           if git diff --cached --quiet && git diff --quiet; then
@@ -153,7 +155,13 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          if [ "${{ steps.detect.outputs.has_changes }}" = "true" ] || [ "${{ inputs.dry_run }}" = "true" ]; then
+          # Validation runs for anything that will publish, and for every dry run.
+          # A run with nothing new to merge but a missing tag or release still has to
+          # validate the tree before publishing, so this is not just "has_changes".
+          if [ "${{ steps.detect.outputs.has_changes }}" = "true" ] \
+             || [ "${{ inputs.dry_run }}" = "true" ] \
+             || [ "${{ steps.detect.outputs.tag_exists }}" = "false" ] \
+             || [ "${{ steps.detect.outputs.release_exists }}" = "false" ]; then
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
@@ -205,13 +213,13 @@ jobs:
             --ignore=deploy/docker/tests/test_7_cleanup.py
 
       - name: Build the published image
-        if: steps.plan.outputs.build_needed == 'true' && inputs.build_image
+        if: steps.plan.outputs.build_needed == 'true'
         run: |
           set -euo pipefail
           docker build -f Dockerfile -t crawl4ai-sync:validate . 2>&1 | tail -25
 
       - name: Assert the image installed this tree and enforces its auth posture
-        if: steps.plan.outputs.build_needed == 'true' && inputs.build_image
+        if: steps.plan.outputs.build_needed == 'true'
         run: |
           set -euo pipefail
 
@@ -271,7 +279,7 @@ jobs:
 
       - name: Resolve tag and release state
         id: state
-        if: steps.detect.outputs.has_changes == 'true'
+        if: steps.plan.outputs.build_needed == 'true'
         env:
           TAG: ${{ steps.detect.outputs.tag }}
         run: |
@@ -312,7 +320,7 @@ jobs:
           git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
 
       - name: Create the sync tag
-        if: steps.state.outputs.tag_exists == 'false' && inputs.dry_run != true
+        if: steps.state.outputs.tag_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         env:
           TAG: ${{ steps.detect.outputs.tag }}
         run: |
@@ -321,7 +329,7 @@ jobs:
           git push origin "refs/tags/${TAG}"
 
       - name: Create the GitHub release
-        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true
+        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.detect.outputs.tag }}
@@ -342,7 +350,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Publish the Docker image for this tag
-        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true
+        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           TAG: ${{ steps.detect.outputs.tag }}
