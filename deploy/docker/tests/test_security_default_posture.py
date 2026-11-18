@@ -67,10 +67,12 @@ PROTECTED_ENDPOINTS = [
     ("get", "/monitor/browsers", None),
     ("get", "/monitor/endpoints/stats", None),
     ("get", "/monitor/timeline", None),
-    # MCP transport — intentionally public when no API token is configured
-    # (homelab/loopback posture). Individual MCP tool calls are still
-    # authenticated via the internal service-token proxy.
-    # ("get", "/mcp/schema", None),
+    # MCP transport — always gated. The fork previously exempted /mcp/* from
+    # the auth gate when no static api_token was configured, which bypassed
+    # authentication for JWT-only deployments too (jwt_enabled is a valid
+    # credential mode with no static token). Adopting upstream's posture:
+    # /mcp/* is authenticated like every other data route.
+    ("get", "/mcp/schema", None),
 ]
 
 # UI shell pages that are intentionally public — they serve only static
