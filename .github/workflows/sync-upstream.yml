@@ -256,11 +256,14 @@ jobs:
           # python runs an empty program, which exits 0 and makes the whole gate a no-op.
           check() {  # check <container> <path> <method> <expected>
             docker exec -i "$1" python3 - "$2" "$3" "$4" <<'CHK'
-          import sys, urllib.request, urllib.error
+          import sys, json, urllib.request, urllib.error
           path, method, want = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          # A body that satisfies the request model, so a POST is judged on auth and not on
+          # 422 validation errors (POST /token validates its body before refusing).
+          body = json.dumps({"email": "sync-gate@example.com"}).encode() if method == "POST" else None
           req = urllib.request.Request(
               "http://127.0.0.1:11235" + path, method=method,
-              data=b"{}" if method == "POST" else None,
+              data=body,
               headers={"Content-Type": "application/json"},
           )
           try:
