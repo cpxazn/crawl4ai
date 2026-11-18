@@ -45,22 +45,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Verify the checked-out revision
-        if: inputs.ref != ''
-        env:
-          INPUT_REF: ${{ inputs.ref }}
+      - name: Resolve the checked-out revision
+        id: rev
         run: |
           set -euo pipefail
           head_sha="$(git rev-parse HEAD)"
-          echo "checked out ${head_sha} (requested ${INPUT_REF})"
-          if [ "${head_sha}" != "${INPUT_REF}" ]; then
-            echo "::error::checked out ${head_sha}, expected the requested ${INPUT_REF}; refusing to publish this image."
+          echo "sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "building from ${head_sha}"
+
+      - name: Verify the requested revision was checked out
+        if: inputs.ref != ''
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          HEAD_SHA: ${{ steps.rev.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "checked out ${HEAD_SHA} (requested ${INPUT_REF})"
+          if [ "${HEAD_SHA}" != "${INPUT_REF}" ]; then
+            echo "::error::checked out ${HEAD_SHA}, expected the requested ${INPUT_REF}; refusing to publish this image."
             exit 1
           fi
-
-      - name: Extract version from release or rebuild tag
-        id: version
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -105,9 +109,12 @@ jobs:
 
           echo "publish_latest=${publish_latest}" >> "$GITHUB_OUTPUT"
 
+      - name: Extract version from release or rebuild tag
+        id: version
+        shell: bash
       - name: Recheck publication state before building
         id: published
-        if: steps.version.outputs.has_version == 'true'
+        if: startsWith(steps.version.outputs.version, 'sync-')
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -159,6 +166,7 @@ jobs:
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push Docker image
+        id: build
         if: steps.published.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
@@ -168,10 +176,29 @@ jobs:
           push: true
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
           build-args: |
-            GIT_COMMIT=${{ inputs.ref || github.sha }}
+            GIT_COMMIT=${{ steps.rev.outputs.sha }}
             GIT_BRANCH=${{ github.ref_name }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Report what this run published
+        if: always()
+        env:
+          REV: ${{ steps.rev.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Machine-readable markers: the sync workflow reads them back from this run's log
+          # to tie the published digest to the publisher it selected, instead of comparing a
+          # tag against itself.
+          echo "::notice::published-revision=${REV:-unknown}"
+          echo "::notice::published-digest=${DIGEST:-none}"
+          echo "published-revision=${REV:-unknown}"
+          echo "published-digest=${DIGEST:-none}"
+          echo "published-version=${VERSION:-unknown}"

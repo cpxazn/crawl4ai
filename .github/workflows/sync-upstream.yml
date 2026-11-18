@@ -198,7 +198,7 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet -e .
           python -m pip install --quiet -r deploy/docker/requirements.txt
-          python -m pip install --quiet pytest pyjwt pytest-asyncio "pydantic[email]" build
+          python -m pip install --quiet pytest pyjwt pytest-asyncio "pydantic[email]" build pyyaml
 
       - name: Compile and import the Docker server
         if: steps.plan.outputs.build_needed == 'true'
@@ -230,6 +230,16 @@ jobs:
             --ignore=deploy/docker/tests/test_5_pool_stress.py \
             --ignore=deploy/docker/tests/test_6_multi_endpoint.py \
             --ignore=deploy/docker/tests/test_7_cleanup.py
+
+      - name: Workflow logic harnesses
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          # The merge policy and the publication decisions are shell logic, so they are
+          # covered by harnesses that run the real step bodies (from this file) against
+          # synthetic repositories and fake gh/curl/docker.
+          python .github/harness/test_merge_step.py .github/workflows/sync-upstream.yml
+          python .github/harness/test_publish_step.py             .github/workflows/sync-upstream.yml             .github/workflows/docker-release.yml
 
       - name: Build the published image
         if: steps.plan.outputs.build_needed == 'true'
@@ -465,8 +475,8 @@ jobs:
           # the commit this run validated.
           token: ${{ github.token }}
 
-      - name: Publish the Docker image for this tag
-        if: steps.detect.outputs.image_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
+      - name: Publish and verify the Docker image for this tag
+        if: inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           TAG: ${{ steps.detect.outputs.tag }}
@@ -474,51 +484,61 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Publication is asynchronous: adopt an already queued/running run for this tag
-          # instead of dispatching a second one, and never adopt a completed one — an old
-          # failed run must not satisfy this attempt.
-          listed_ids() {  # every run id currently visible, one per line
-            gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
-              --limit 50 --json databaseId --jq '.[].databaseId'
+          # Verification is separate from pushing: an image that already exists (a retry, or a
+          # publication that completed while this run was validating) must still be verified
+          # against the commit this run validated, not silently accepted.
+          verify_published() {
+            docker pull --quiet "${IMAGE_NAME}:${TAG}" > /dev/null
+            label_sha="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null || true)"
+            pulled_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null | sed 's/.*@//')"
+            registry_digest="$(curl -s --max-time 20     "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${TAG}"     | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("digest") or ((d.get("images") or [{}])[0]).get("digest") or "")'       2>/dev/null || true)"
+            echo "${IMAGE_NAME}:${TAG} label=${label_sha:-none} registry_digest=${registry_digest:-unknown} pulled_digest=${pulled_digest:-unknown}"
+            if [ "${label_sha}" != "${SHA}" ]; then
+              echo "::error::the published image is labelled ${label_sha:-none}, not the validated ${SHA}"
+              return 1
+            fi
+            if [ -z "${registry_digest}" ] || [ "${registry_digest}" != "${pulled_digest}" ]; then
+              echo "::error::the registry digest for ${IMAGE_NAME}:${TAG} does not match the pulled image"
+              return 1
+            fi
           }
 
-          run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
-            --limit 50 --json databaseId,status,displayTitle \
-            --jq "[.[] | select(.displayTitle == \"docker ${TAG}\" and .status != \"completed\")][0].databaseId // empty")"
+          if [ "${{ steps.detect.outputs.image_exists }}" = "true" ]; then
+            echo "${IMAGE_NAME}:${TAG} already exists (retry, or published during validation); verifying instead of pushing."
+            verify_published
+            echo "verified ${IMAGE_NAME}:${TAG} at ${SHA} (digest ${registry_digest})"
+            exit 0
+          fi
+
+          # Publication is asynchronous: adopt an already queued/running run for this tag instead
+          # of dispatching a second one, and never adopt a completed one — an old failed run must
+          # not satisfy this attempt.
+          run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml   --limit 50 --json databaseId,status,displayTitle   --jq "[.[] | select(.displayTitle == \"docker ${TAG}\" and .status != \"completed\")][0].databaseId // empty")"
 
           if [ -n "${run_id}" ]; then
             echo "adopting in-flight publication run ${run_id} for ${TAG}"
           else
-            before_ids="$(listed_ids | tr '\n' ' ')"
+            before_ids="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml     --limit 50 --json databaseId --jq '.[].databaseId' | tr '
+          ' ' ')"
             if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
               echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
             fi
-            gh workflow run docker-release.yml \
-              --repo "${GITHUB_REPOSITORY}" \
-              --ref "${SYNC_BRANCH}" \
-              -f tag="${TAG}" \
-              -f ref="${SHA}"
-            # Accept only an id that did not exist before the dispatch: matching on the run
-            # name alone would happily adopt an earlier failure for the same tag.
+            gh workflow run docker-release.yml     --repo "${GITHUB_REPOSITORY}"     --ref "${SYNC_BRANCH}"     -f tag="${TAG}"     -f ref="${SHA}"
             for _ in $(seq 1 40); do
               sleep 10
-              run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
-                --limit 50 --json databaseId,displayTitle \
-                --jq "[.[] | select(.displayTitle == \"docker ${TAG}\")][0].databaseId // empty")"
-              if [ -n "${run_id}" ] && ! printf ' %s ' "${before_ids}" | grep -q " ${run_id} "; then
+              candidate="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml       --limit 50 --json databaseId,displayTitle       --jq "[.[] | select(.displayTitle == \"docker ${TAG}\")][0].databaseId // empty")"
+              if [ -n "${candidate}" ] && ! printf ' %s ' "${before_ids}" | grep -q " ${candidate} "; then
+                run_id="${candidate}"
                 break
               fi
-              run_id=""
             done
             [ -n "${run_id}" ] || { echo "::error::the dispatch for ${TAG} produced no new run."; exit 1; }
-            echo "dispatched publication run ${run_id} for ${TAG} (excluded pre-existing: ${before_ids:-none})"
+            echo "dispatched publication run ${run_id} for ${TAG} (pre-existing ids excluded: ${before_ids:-none})"
           fi
 
-          # A successful dispatch only proves enqueueing, so wait for the real outcome.
           status=""
           for _ in $(seq 1 180); do
-            status="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json status,conclusion \
-              --jq '"\(.status) \(.conclusion)"')"
+            status="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json status,conclusion     --jq '"\(.status) \(.conclusion)"')"
             echo "${TAG} run ${run_id}: ${status}"
             case "${status}" in
               "completed success") break ;;
@@ -526,38 +546,27 @@ jobs:
             esac
             sleep 30
           done
-          [ "${status}" = "completed success" ] \
-            || { echo "::error::docker-release run ${run_id} did not finish in time (${status})"; exit 1; }
+          [ "${status}" = "completed success" ]   || { echo "::error::docker-release run ${run_id} did not finish in time (${status})"; exit 1; }
 
-          built_sha="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
-          echo "publication run headSha ${built_sha} (validated ${SHA})"
-          if [ "${built_sha}" != "${SHA}" ]; then
-            echo "::error::publication run ${run_id} ran on ${built_sha}, not the validated ${SHA}"
+          # Tie the published digest to the publisher this run selected, using the markers that
+          # publisher printed, rather than comparing the tag against itself.
+          publisher_log="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --log 2>/dev/null || true)"
+          pub_revision="$(printf '%s
+          ' "${publisher_log}" | grep -oE 'published-revision=[0-9a-f]{7,40}' | tail -1 | cut -d= -f2)"
+          pub_digest="$(printf '%s
+          ' "${publisher_log}" | grep -oE 'published-digest=sha256:[0-9a-f]+' | tail -1 | cut -d= -f2)"
+          echo "publisher ${run_id} reported revision=${pub_revision:-none} digest=${pub_digest:-none}"
+          if [ "${pub_revision}" != "${SHA}" ]; then
+            echo "::error::the publisher built ${pub_revision:-nothing}, not the validated ${SHA}"
             exit 1
           fi
 
-          # The publisher asserts its own checkout, and the image carries the revision label,
-          # so verify what was actually pushed rather than trusting the dispatch.
-          docker pull --quiet "${IMAGE_NAME}:${TAG}" > /dev/null
-          label_sha="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null || true)"
-          echo "${IMAGE_NAME}:${TAG} source-revision label=${label_sha:-none}"
-          if [ "${label_sha}" != "${SHA}" ]; then
-            echo "::error::the published image is labelled ${label_sha:-none}, not the validated ${SHA}"
+          verify_published
+          if [ "${pub_digest}" != "${registry_digest}" ]; then
+            echo "::error::publisher ${run_id} reported digest ${pub_digest:-none}, registry has ${registry_digest}"
             exit 1
           fi
-
-          # The registry, not the workflow log, is the source of truth for "it is published".
-          registry_digest="$(curl -s --max-time 20 \
-            "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${TAG}" \
-            | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("digest") or ((d.get("images") or [{}])[0]).get("digest") or "")' \
-              2>/dev/null || true)"
-          local_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null | sed 's/.*@//')"
-          echo "registry digest=${registry_digest:-unknown} pulled digest=${local_digest:-unknown}"
-          if [ -z "${registry_digest}" ] || [ "${registry_digest}" != "${local_digest}" ]; then
-            echo "::error::the registry digest for ${IMAGE_NAME}:${TAG} does not match the pulled image."
-            exit 1
-          fi
-          echo "published ${IMAGE_NAME}:${TAG} at ${SHA} (digest ${registry_digest})"
+          echo "published and verified ${IMAGE_NAME}:${TAG} at ${SHA} (digest ${registry_digest})"
 
       - name: Job summary
         if: always()
