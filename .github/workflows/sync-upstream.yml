@@ -426,14 +426,21 @@ jobs:
           remote_tag_sha="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
           if [ -n "${remote_tag_sha}" ]; then
             tag_exists=true
-            if [ "${remote_tag_sha}" != "${head_sha}" ]; then
-              echo "::error::tag ${TAG} already points at ${remote_tag_sha}, not ${head_sha}; refusing to move or reuse it."
-              exit 1
+            tag_sha="${remote_tag_sha}"
+            # The tag is immutable. If the branch has moved on since it was created (a fork
+            # commit, a workflow fix), that is not an error and not a reason to move it: the
+            # tag names the commit that was validated in its own run, and publication is
+            # about that commit, so publishing keeps using the tag's SHA.
+            if [ "${remote_tag_sha}" = "${head_sha}" ]; then
+              tag_matches=true
+            else
+              tag_matches=false
+              echo "tag ${TAG} already exists at ${tag_sha}; HEAD is ${head_sha} — publishing the tag's commit, not HEAD."
             fi
-            tag_matches=true
           else
             tag_exists=false
             tag_matches=false
+            tag_sha=""
           fi
 
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
@@ -442,8 +449,12 @@ jobs:
             release_exists=false
           fi
 
+          if [ -n "${remote_tag_sha}" ]; then publish_sha="${remote_tag_sha}"; else publish_sha="${head_sha}"; fi
+
           {
             echo "head_sha=${head_sha}"
+            echo "tag_sha=${tag_sha}"
+            echo "publish_sha=${publish_sha}"
             echo "tag_exists=${tag_exists}"
             echo "tag_matches=${tag_matches}"
             echo "release_exists=${release_exists}"
@@ -470,7 +481,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.detect.outputs.tag }}
-          target_commitish: ${{ steps.state.outputs.head_sha }}
+          target_commitish: ${{ steps.state.outputs.publish_sha }}
           name: Sync ${{ steps.detect.outputs.tag }}
           generate_release_notes: true
           body: |
@@ -480,7 +491,7 @@ jobs:
             - Upstream commit: `${{ steps.detect.outputs.upstream_sha }}`
             - Merge base before sync: `${{ steps.detect.outputs.merge_base }}`
             - Upstream commits merged: ${{ steps.detect.outputs.upstream_ahead_count }}
-            - Synced commit (validated before push): `${{ steps.state.outputs.head_sha }}`
+            - Synced commit (validated before push): `${{ steps.state.outputs.publish_sha }}`
           # github.token by design: this release must not fire the release-triggered
           # Docker workflow, which is dispatched explicitly below so it always builds
           # the commit this run validated.
@@ -495,7 +506,7 @@ jobs:
           # token". workflow_dispatch is one of the two events GITHUB_TOKEN may trigger.
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.detect.outputs.tag }}
-          SHA: ${{ steps.state.outputs.head_sha }}
+          SHA: ${{ steps.state.outputs.publish_sha }}
         run: |
           set -euo pipefail
 
@@ -600,6 +611,7 @@ jobs:
             echo "| upstream ahead | ${{ steps.detect.outputs.upstream_ahead_count }} |"
             echo "| changes | ${{ steps.detect.outputs.has_changes }} |"
             echo "| merge commit | \`${{ steps.state.outputs.head_sha }}\` |"
+            echo "| published commit | \`${{ steps.state.outputs.publish_sha }}\` |"
             echo "| tag | \`${{ steps.detect.outputs.tag }}\` |"
             echo "| tag existed | ${{ steps.detect.outputs.tag_exists }} |"
             echo "| release existed | ${{ steps.detect.outputs.release_exists }} |"
