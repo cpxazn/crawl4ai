@@ -45,6 +45,19 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Verify the checked-out revision
+        if: inputs.ref != ''
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          echo "checked out ${head_sha} (requested ${INPUT_REF})"
+          if [ "${head_sha}" != "${INPUT_REF}" ]; then
+            echo "::error::checked out ${head_sha}, expected the requested ${INPUT_REF}; refusing to publish this image."
+            exit 1
+          fi
+
       - name: Extract version from release or rebuild tag
         id: version
         shell: bash
@@ -92,6 +105,33 @@ jobs:
 
           echo "publish_latest=${publish_latest}" >> "$GITHUB_OUTPUT"
 
+      - name: Recheck publication state before building
+        id: published
+        if: steps.version.outputs.has_version == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Serialised by the concurrency group, but serialisation is not idempotence: a
+          # queued duplicate must not rebuild a tag that a previous run already pushed.
+          # Only an explicit 404 means "not published"; anything else fails loudly.
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" || echo 000)"
+          case "${code}" in
+            200)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "${IMAGE_NAME}:${VERSION} is already published; skipping the build."
+              ;;
+            404)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "${IMAGE_NAME}:${VERSION} is not published yet; building."
+              ;;
+            *)
+              echo "::error::registry lookup for ${IMAGE_NAME}:${VERSION} returned ${code}; refusing to guess."
+              exit 1
+              ;;
+          esac
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -119,6 +159,7 @@ jobs:
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push Docker image
+        if: steps.published.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -129,7 +170,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            GIT_COMMIT=${{ github.sha }}
+            GIT_COMMIT=${{ inputs.ref || github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: type=gha

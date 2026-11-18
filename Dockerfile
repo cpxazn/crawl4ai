@@ -32,9 +32,15 @@ ARG TARGETARCH
 # --build-arg REDIS_VERSION="6:7.2.7-1rl1~bookworm1" for a specific version.
 ARG REDIS_VERSION="6:7.2.7-1rl1~bookworm1"
 
+# Source revision of the tree this image was built from. The sync workflow verifies
+# this label on the published image, so the image can be traced to the exact commit
+# that passed the gate instead of to a branch name.
+ARG GIT_COMMIT=unknown
+
 LABEL maintainer="unclecode"
 LABEL description="🔥🕷️ Crawl4AI: Open-source LLM Friendly Web Crawler & scraper"
 LABEL version="1.0"
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
 
 # Install curl and gnupg first (needed to add Redis repo)
 RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg \

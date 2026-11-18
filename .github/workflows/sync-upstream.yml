@@ -305,16 +305,30 @@ jobs:
           fi
           echo "package manifest self-test verified: a changed ${victim} fails"
 
-          # The deployed server files, which are not part of the installed package.
-          for rel in deploy/docker/server.py deploy/docker/fork_field_filter.py deploy/docker/api.py; do
+          # Runtime files, not the staging copy. supervisord runs gunicorn with `directory=/app`
+          # and `server:app`, and the Dockerfile copies deploy/docker/* into /app, so these are
+          # the files that actually execute. Hashing /tmp/project would only prove the build
+          # input was copied into the image.
+          docker run --rm --entrypoint python3 crawl4ai-sync:validate -c \
+            "import sys,pathlib; p=pathlib.Path('/app/supervisord.conf'); \
+             txt=p.read_text(); sys.exit(0 if ('server:app' in txt and 'directory=/app' in txt) else 1)" \
+            || fail "the runtime supervisor config does not launch server:app from /app"
+          echo "runtime entrypoint confirmed: gunicorn server:app with directory=/app"
+
+          for pair in "server.py:deploy/docker/server.py" \
+                      "api.py:deploy/docker/api.py" \
+                      "fork_field_filter.py:deploy/docker/fork_field_filter.py" \
+                      "schemas.py:deploy/docker/schemas.py"; do
+            runtime="/app/${pair%%:*}"
+            rel="${pair#*:}"
             in_image="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate \
-              -c "import hashlib;print(hashlib.sha256(open('/tmp/project/${rel}','rb').read()).hexdigest())")" \
-              || fail "${rel} is missing from the image"
+              -c "import hashlib;print(hashlib.sha256(open('${runtime}','rb').read()).hexdigest())")" \
+              || fail "${runtime} is missing from the image"
             in_repo="$(python3 -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('${rel}').read_bytes()).hexdigest())")"
-            echo "${rel} sha256 image=${in_image} repo=${in_repo}"
-            [ "${in_image}" = "${in_repo}" ] || fail "${rel} in the image does not match this checkout"
+            echo "${runtime} vs ${rel} sha256 image=${in_image} repo=${in_repo}"
+            [ "${in_image}" = "${in_repo}" ] || fail "${runtime} does not match ${rel} in this checkout"
           done
-          echo "deployed server files verified inside the image"
+          echo "runtime server files verified inside the image"
 
           # Assertions run inside the container so a shell compare can never fail on
           # formatting: each check prints what it saw and exits non-zero on a mismatch.
@@ -461,11 +475,11 @@ jobs:
           set -euo pipefail
 
           # Publication is asynchronous: adopt an already queued/running run for this tag
-          # instead of dispatching a second one, so a retry cannot build the same tag twice.
-          find_run() {  # find_run <exclude-id>
+          # instead of dispatching a second one, and never adopt a completed one — an old
+          # failed run must not satisfy this attempt.
+          listed_ids() {  # every run id currently visible, one per line
             gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
-              --limit 50 --json databaseId,status,displayTitle \
-              --jq "[.[] | select(.displayTitle == \"docker ${TAG}\" and .databaseId != ${1:-0})][0].databaseId // empty"
+              --limit 50 --json databaseId --jq '.[].databaseId'
           }
 
           run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
@@ -475,6 +489,7 @@ jobs:
           if [ -n "${run_id}" ]; then
             echo "adopting in-flight publication run ${run_id} for ${TAG}"
           else
+            before_ids="$(listed_ids | tr '\n' ' ')"
             if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
               echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
             fi
@@ -483,13 +498,20 @@ jobs:
               --ref "${SYNC_BRANCH}" \
               -f tag="${TAG}" \
               -f ref="${SHA}"
-            for _ in $(seq 1 30); do
+            # Accept only an id that did not exist before the dispatch: matching on the run
+            # name alone would happily adopt an earlier failure for the same tag.
+            for _ in $(seq 1 40); do
               sleep 10
-              run_id="$(find_run "")"
-              [ -n "${run_id}" ] && break
+              run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
+                --limit 50 --json databaseId,displayTitle \
+                --jq "[.[] | select(.displayTitle == \"docker ${TAG}\")][0].databaseId // empty")"
+              if [ -n "${run_id}" ] && ! printf ' %s ' "${before_ids}" | grep -q " ${run_id} "; then
+                break
+              fi
+              run_id=""
             done
-            [ -n "${run_id}" ] || { echo "::error::the docker-release dispatch for ${TAG} never appeared."; exit 1; }
-            echo "dispatched publication run ${run_id} for ${TAG}"
+            [ -n "${run_id}" ] || { echo "::error::the dispatch for ${TAG} produced no new run."; exit 1; }
+            echo "dispatched publication run ${run_id} for ${TAG} (excluded pre-existing: ${before_ids:-none})"
           fi
 
           # A successful dispatch only proves enqueueing, so wait for the real outcome.
@@ -508,22 +530,34 @@ jobs:
             || { echo "::error::docker-release run ${run_id} did not finish in time (${status})"; exit 1; }
 
           built_sha="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
-          echo "publication built commit ${built_sha} (validated ${SHA})"
+          echo "publication run headSha ${built_sha} (validated ${SHA})"
           if [ "${built_sha}" != "${SHA}" ]; then
-            echo "::error::the image was built from ${built_sha}, not the validated ${SHA}"
+            echo "::error::publication run ${run_id} ran on ${built_sha}, not the validated ${SHA}"
+            exit 1
+          fi
+
+          # The publisher asserts its own checkout, and the image carries the revision label,
+          # so verify what was actually pushed rather than trusting the dispatch.
+          docker pull --quiet "${IMAGE_NAME}:${TAG}" > /dev/null
+          label_sha="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null || true)"
+          echo "${IMAGE_NAME}:${TAG} source-revision label=${label_sha:-none}"
+          if [ "${label_sha}" != "${SHA}" ]; then
+            echo "::error::the published image is labelled ${label_sha:-none}, not the validated ${SHA}"
             exit 1
           fi
 
           # The registry, not the workflow log, is the source of truth for "it is published".
-          digest="$(curl -s --max-time 20 \
+          registry_digest="$(curl -s --max-time 20 \
             "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${TAG}" \
             | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("digest") or ((d.get("images") or [{}])[0]).get("digest") or "")' \
               2>/dev/null || true)"
-          echo "${IMAGE_NAME}:${TAG} digest=${digest:-unknown}"
-          if [ -z "${digest}" ]; then
-            echo "::error::${IMAGE_NAME}:${TAG} is absent from the registry after a successful publication run."
+          local_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE_NAME}:${TAG}" 2>/dev/null | sed 's/.*@//')"
+          echo "registry digest=${registry_digest:-unknown} pulled digest=${local_digest:-unknown}"
+          if [ -z "${registry_digest}" ] || [ "${registry_digest}" != "${local_digest}" ]; then
+            echo "::error::the registry digest for ${IMAGE_NAME}:${TAG} does not match the pulled image."
             exit 1
           fi
+          echo "published ${IMAGE_NAME}:${TAG} at ${SHA} (digest ${registry_digest})"
 
       - name: Job summary
         if: always()
