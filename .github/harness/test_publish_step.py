@@ -36,6 +36,7 @@ RELEASE_WORKFLOW = Path(sys.argv[2] if len(sys.argv) > 2 else SYNC_WORKFLOW)
 
 PUBLISH_STEP = "Publish and verify the Docker image for this tag"
 RECHECK_STEP = "Recheck publication state before building"
+REPORT_STEP = "Report what this run published"
 
 TAG = "sync-abcdef1234567890"
 SHA = "abcdef1234567890abcdef1234567890abcdef12"
@@ -321,6 +322,13 @@ def main() -> int:
                 else ["an existing image was not verified"]
             )))
 
+        results.append(run_publish_case(
+            root, SYNC_WORKFLOW, "publisher-reused",
+            {**base, "publisher_action": "reused"}, False, 0,
+            lambda out, final: (
+                [] if f"digest {DIGEST}" in out else ["a reused publication was not accepted"]
+            )))
+
         # Verification-failure-then-retry: the first attempt fails on the label, and the
         # retry must verify the (now existing) image instead of accepting it.
         failed = run_publish_case(
@@ -334,6 +342,52 @@ def main() -> int:
                 [] if "verifying instead of pushing" in out and (final.get("dispatches") or 0) == 0
                 else ["the retry did not re-verify the existing image"]
             )))
+
+        # Publisher-side reuse: a skipped build must report the published digest, not "none".
+        report_body, _ = extract_step(RELEASE_WORKFLOW, REPORT_STEP)
+        for name, code, expect_exit, expect_substr in (
+            ("reporter-reused", 200, 0, "published-action=reused"),
+            ("reporter-reused-unpublished", 404, 1, "is not published"),
+        ):
+            case_dir = root / name
+            case_dir.mkdir()
+            bin_dir = case_dir / "bin"
+            bin_dir.mkdir()
+            write_fakes(bin_dir)
+            state_file = case_dir / "state.json"
+            state_file.write_text(
+                json.dumps({"registry_code": code, "registry_digest": DIGEST,
+                            "image_label": SHA, "image_digest": DIGEST, "runs": []}),
+                encoding="utf-8",
+            )
+            script_path = case_dir / "step.sh"
+            script_path.write_text(report_body + "\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+            env["STATE_FILE"] = str(state_file)
+            env["IMAGE_NAME"] = "cpxazn/crawl4ai"
+            env["VERSION"] = TAG
+            env["REV"] = SHA
+            env["DIGEST"] = ""
+            env["SKIPPED"] = "true"
+            result = subprocess.run(["bash", str(script_path)], env=env, capture_output=True, text=True)
+            output = result.stdout + result.stderr
+            problems = []
+            if result.returncode != expect_exit:
+                problems.append(f"exit={result.returncode} want {expect_exit}")
+            if expect_substr not in output:
+                problems.append(f"missing {expect_substr!r} in output")
+            if expect_exit == 0 and f"published-digest={DIGEST}" not in output:
+                problems.append("the reused publication did not report the published digest")
+            if problems:
+                print(f"FAIL  {name}")
+                for problem in problems:
+                    print(f"      {problem}")
+                print("      tail:", output.strip().splitlines()[-8:])
+                results.append(False)
+            else:
+                print(f"PASS  {name}")
+                results.append(True)
 
         # docker-release recheck step
         recheck, recheck_if = extract_step(RELEASE_WORKFLOW, RECHECK_STEP)

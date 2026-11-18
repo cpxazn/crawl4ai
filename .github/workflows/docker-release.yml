@@ -65,6 +65,10 @@ jobs:
             echo "::error::checked out ${HEAD_SHA}, expected the requested ${INPUT_REF}; refusing to publish this image."
             exit 1
           fi
+
+      - name: Extract version from release or rebuild tag
+        id: version
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -109,9 +113,7 @@ jobs:
 
           echo "publish_latest=${publish_latest}" >> "$GITHUB_OUTPUT"
 
-      - name: Extract version from release or rebuild tag
-        id: version
-        shell: bash
+
       - name: Recheck publication state before building
         id: published
         if: startsWith(steps.version.outputs.version, 'sync-')
@@ -138,6 +140,7 @@ jobs:
               exit 1
               ;;
           esac
+
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -192,13 +195,39 @@ jobs:
           REV: ${{ steps.rev.outputs.sha }}
           DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ steps.version.outputs.version }}
+          SKIPPED: ${{ steps.published.outputs.skip }}
         run: |
           set -euo pipefail
+
+          action="built"
+          digest="${DIGEST}"
+          if [ "${SKIPPED:-false}" = "true" ] || [ -z "${digest}" ]; then
+            # A skipped build has no build-push digest. Report the digest that is actually
+            # published for this version, and say so, instead of emitting "none" and making
+            # the consumer reject a perfectly valid image.
+            action="reused"
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+              "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" || echo 000)"
+            if [ "${code}" != "200" ]; then
+              echo "::error::skipped the build, but ${IMAGE_NAME}:${VERSION} is not published (HTTP ${code})."
+              exit 1
+            fi
+            digest="$(curl -s --max-time 20 \
+              "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" \
+              | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("digest") or ((d.get("images") or [{}])[0]).get("digest") or "")')"
+            if [ -z "${digest}" ]; then
+              echo "::error::could not read the published digest for ${VERSION}"
+              exit 1
+            fi
+          fi
+
           # Machine-readable markers: the sync workflow reads them back from this run's log
           # to tie the published digest to the publisher it selected, instead of comparing a
           # tag against itself.
+          echo "::notice::published-action=${action}"
           echo "::notice::published-revision=${REV:-unknown}"
-          echo "::notice::published-digest=${DIGEST:-none}"
+          echo "::notice::published-digest=${digest}"
+          echo "published-action=${action}"
           echo "published-revision=${REV:-unknown}"
-          echo "published-digest=${DIGEST:-none}"
+          echo "published-digest=${digest}"
           echo "published-version=${VERSION:-unknown}"

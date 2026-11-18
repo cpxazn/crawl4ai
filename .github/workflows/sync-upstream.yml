@@ -236,10 +236,18 @@ jobs:
         run: |
           set -euo pipefail
           # The merge policy and the publication decisions are shell logic, so they are
-          # covered by harnesses that run the real step bodies (from this file) against
-          # synthetic repositories and fake gh/curl/docker.
+          # covered by harnesses that run the real step bodies against synthetic
+          # repositories and fake gh/curl/docker. The structure check rejects duplicate
+          # keys and steps that lost their run:/uses:.
+          python .github/harness/test_workflow_structure.py
           python .github/harness/test_merge_step.py .github/workflows/sync-upstream.yml
-          python .github/harness/test_publish_step.py             .github/workflows/sync-upstream.yml             .github/workflows/docker-release.yml
+          python .github/harness/test_publish_step.py .github/workflows/sync-upstream.yml .github/workflows/docker-release.yml
+
+      - name: Lint the workflows with actionlint
+        if: steps.plan.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/repo" -w /repo rhysd/actionlint:latest .github/workflows/sync-upstream.yml .github/workflows/docker-release.yml
 
       - name: Build the published image
         if: steps.plan.outputs.build_needed == 'true'
