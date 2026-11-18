@@ -1,5 +1,10 @@
 name: Publish Docker Image
 
+# Deterministic run name: it is how the sync workflow recognises an in-flight
+# publication for a given tag, so a retry waits for the existing run instead of
+# dispatching a second one.
+run-name: docker ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+
 permissions:
   contents: read
 
@@ -21,8 +26,9 @@ on:
         required: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  # Queue, never cancel: cancelling a multi-arch push mid-flight leaves a half-published tag.
+  cancel-in-progress: false
 
 env:
   PLATFORMS: linux/amd64,linux/arm64

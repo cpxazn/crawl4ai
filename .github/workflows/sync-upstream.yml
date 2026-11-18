@@ -34,7 +34,7 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 240
 
     steps:
       - name: Checkout the sync branch
@@ -102,12 +102,17 @@ jobs:
           # Docker publication is tracked independently of the release: a run that dies after
           # creating the release but before the image dispatch must be able to retry just the
           # image. The image tag is the sync tag itself (docker-release derives the version
-          # from `-f tag`), so the registry answers "is this published yet?".
-          if curl -fsS "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${tag}" > /dev/null 2>&1; then
-            image_exists=true
-          else
-            image_exists=false
-          fi
+          # from `-f tag`), so the registry answers "is this published yet?". Only an explicit
+          # 404 means "absent": timeouts, rate limits and 5xx must fail the run instead of
+          # silently triggering another publication.
+          hub_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+            "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${tag}" || echo 000)"
+          case "${hub_code}" in
+            200) image_exists=true ;;
+            404) image_exists=false ;;
+            *) echo "::error::Docker Hub lookup for ${IMAGE_NAME}:${tag} returned ${hub_code}; refusing to guess whether the image exists."
+               exit 1 ;;
+          esac
 
           {
             echo "merge_base=${merge_base}"
@@ -237,18 +242,79 @@ jobs:
         run: |
           set -euo pipefail
 
+          fail() { echo "::error::$1"; exit 1; }
+
           installed="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,os;print(os.path.realpath(crawl4ai.__file__))')"
           echo "image installed crawl4ai from: ${installed}"
 
-          # `crawl4ai.__file__` only proves the package was imported; the same path shows up
-          # whether the image installed this checkout or a downloaded release. Compare a file
-          # hash instead, so the claim "the image contains this tree" is actually tested.
-          in_image="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,hashlib,os;print(hashlib.sha256(open(os.path.realpath(crawl4ai.__file__),"rb").read()).hexdigest())')"
-          in_repo="$(python3 -c 'import hashlib,pathlib;print(hashlib.sha256(pathlib.Path("crawl4ai/__init__.py").read_bytes()).hexdigest())')"
-          echo "crawl4ai/__init__.py sha256: image=${in_image} repo=${in_repo}"
-          if [ "${in_image}" != "${in_repo}" ]; then
-            fail "the image does not contain this checkout (sha256 mismatch)"
+          # Provenance. `crawl4ai.__file__` is site-packages whether the image installed this
+          # checkout or a downloaded release, and one matching file proves nothing (a different
+          # release can share __init__.py). Hash every .py in the package plus the deployed
+          # server/filter files this fork actually changed.
+          manifest="$(python3 - <<'PY'
+          import hashlib, pathlib
+          root = pathlib.Path("crawl4ai")
+          for path in sorted(root.rglob("*.py")):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              print(f"{path.relative_to(root).as_posix()} {digest}")
+          PY
+          )"
+          manifest_files="$(printf '%s\n' "${manifest}" | wc -l | tr -d ' ')"
+          echo "checkout package files: ${manifest_files}"
+
+          verify_manifest() {  # verify_manifest <manifest> <expected-count>
+            docker run --rm -i --entrypoint python3 \
+              -e EXPECTED_MANIFEST="$1" -e EXPECTED_COUNT="$2" \
+              crawl4ai-sync:validate - <<'PY'
+          import hashlib, os, pathlib, sys
+          import crawl4ai
+
+          package = pathlib.Path(crawl4ai.__file__).resolve().parent
+          expected = {}
+          for line in os.environ["EXPECTED_MANIFEST"].splitlines():
+              if line.strip():
+                  rel, digest = line.split(" ", 1)
+                  expected[rel] = digest
+          want = int(os.environ["EXPECTED_COUNT"])
+          missing = [rel for rel in expected if not (package / rel).is_file()]
+          mismatched = [
+              rel for rel, digest in expected.items()
+              if (package / rel).is_file()
+              and hashlib.sha256((package / rel).read_bytes()).hexdigest() != digest
+          ]
+          print(f"package={package} files_in_manifest={len(expected)} expected={want}")
+          if missing:
+              print("missing:", ", ".join(missing[:10]))
+          if mismatched:
+              print("mismatched:", ", ".join(mismatched[:10]))
+          sys.exit(0 if not missing and not mismatched and len(expected) == want else 1)
+          PY
+          }
+
+          verify_manifest "${manifest}" "${manifest_files}" \
+            || fail "the image does not contain this checkout (package manifest mismatch)"
+          echo "package manifest verified inside the image"
+
+          # Negative self-test: perturb a non-__init__ entry and require the check to fail.
+          # Without this, a manifest comparison that silently compares nothing looks green.
+          victim="$(printf '%s\n' "${manifest}" | grep -v '^__init__\.py ' | head -1 | awk '{print $1}')"
+          [ -n "${victim}" ] || fail "could not pick a non-__init__ file for the manifest self-test"
+          tampered="$(printf '%s\n' "${manifest}" | awk -v v="${victim}" '$1==v{$2="deadbeef"}1')"
+          if verify_manifest "${tampered}" "${manifest_files}" > /dev/null 2>&1; then
+            fail "the package manifest check cannot fail (tampered ${victim} still matched)"
           fi
+          echo "package manifest self-test verified: a changed ${victim} fails"
+
+          # The deployed server files, which are not part of the installed package.
+          for rel in deploy/docker/server.py deploy/docker/fork_field_filter.py deploy/docker/api.py; do
+            in_image="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate \
+              -c "import hashlib;print(hashlib.sha256(open('/tmp/project/${rel}','rb').read()).hexdigest())")" \
+              || fail "${rel} is missing from the image"
+            in_repo="$(python3 -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('${rel}').read_bytes()).hexdigest())")"
+            echo "${rel} sha256 image=${in_image} repo=${in_repo}"
+            [ "${in_image}" = "${in_repo}" ] || fail "${rel} in the image does not match this checkout"
+          done
+          echo "deployed server files verified inside the image"
 
           # Assertions run inside the container so a shell compare can never fail on
           # formatting: each check prints what it saw and exits non-zero on a mismatch.
@@ -288,8 +354,6 @@ jobs:
             docker logs "$1" | tail -30
             return 1
           }
-
-          fail() { echo "::error::$1"; exit 1; }
 
           # No credential configured: loopback bind, /token fails closed, MCP unreachable.
           cid="$(docker run -d --name sync-no-credential crawl4ai-sync:validate)"
@@ -395,18 +459,71 @@ jobs:
           SHA: ${{ steps.state.outputs.head_sha }}
         run: |
           set -euo pipefail
-          if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
-            echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
+
+          # Publication is asynchronous: adopt an already queued/running run for this tag
+          # instead of dispatching a second one, so a retry cannot build the same tag twice.
+          find_run() {  # find_run <exclude-id>
+            gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
+              --limit 50 --json databaseId,status,displayTitle \
+              --jq "[.[] | select(.displayTitle == \"docker ${TAG}\" and .databaseId != ${1:-0})][0].databaseId // empty"
+          }
+
+          run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml \
+            --limit 50 --json databaseId,status,displayTitle \
+            --jq "[.[] | select(.displayTitle == \"docker ${TAG}\" and .status != \"completed\")][0].databaseId // empty")"
+
+          if [ -n "${run_id}" ]; then
+            echo "adopting in-flight publication run ${run_id} for ${TAG}"
+          else
+            if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+              echo "::warning::PAT_TOKEN is not set; the dispatch uses github.token and may be refused."
+            fi
+            gh workflow run docker-release.yml \
+              --repo "${GITHUB_REPOSITORY}" \
+              --ref "${SYNC_BRANCH}" \
+              -f tag="${TAG}" \
+              -f ref="${SHA}"
+            for _ in $(seq 1 30); do
+              sleep 10
+              run_id="$(find_run "")"
+              [ -n "${run_id}" ] && break
+            done
+            [ -n "${run_id}" ] || { echo "::error::the docker-release dispatch for ${TAG} never appeared."; exit 1; }
+            echo "dispatched publication run ${run_id} for ${TAG}"
           fi
-          gh workflow run docker-release.yml \
-            --repo "${GITHUB_REPOSITORY}" \
-            --ref "${SYNC_BRANCH}" \
-            -f tag="${TAG}" \
-            -f ref="${SHA}"
-          sleep 10
-          gh run list --repo "${GITHUB_REPOSITORY}" --workflow docker-release.yml --limit 5 \
-            --json databaseId,event,status,headBranch,displayTitle \
-            --jq '.[] | "\(.databaseId) \(.event) \(.status) \(.displayTitle)"'
+
+          # A successful dispatch only proves enqueueing, so wait for the real outcome.
+          status=""
+          for _ in $(seq 1 180); do
+            status="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json status,conclusion \
+              --jq '"\(.status) \(.conclusion)"')"
+            echo "${TAG} run ${run_id}: ${status}"
+            case "${status}" in
+              "completed success") break ;;
+              completed*) echo "::error::docker-release run ${run_id} finished as ${status}"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          [ "${status}" = "completed success" ] \
+            || { echo "::error::docker-release run ${run_id} did not finish in time (${status})"; exit 1; }
+
+          built_sha="$(gh run view "${run_id}" --repo "${GITHUB_REPOSITORY}" --json headSha --jq .headSha)"
+          echo "publication built commit ${built_sha} (validated ${SHA})"
+          if [ "${built_sha}" != "${SHA}" ]; then
+            echo "::error::the image was built from ${built_sha}, not the validated ${SHA}"
+            exit 1
+          fi
+
+          # The registry, not the workflow log, is the source of truth for "it is published".
+          digest="$(curl -s --max-time 20 \
+            "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${TAG}" \
+            | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("digest") or ((d.get("images") or [{}])[0]).get("digest") or "")' \
+              2>/dev/null || true)"
+          echo "${IMAGE_NAME}:${TAG} digest=${digest:-unknown}"
+          if [ -z "${digest}" ]; then
+            echo "::error::${IMAGE_NAME}:${TAG} is absent from the registry after a successful publication run."
+            exit 1
+          fi
 
       - name: Job summary
         if: always()
