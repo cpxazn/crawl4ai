@@ -29,6 +29,7 @@ concurrency:
 env:
   UPSTREAM_REPO: https://github.com/unclecode/crawl4ai.git
   UPSTREAM_BRANCH: main
+  IMAGE_NAME: cpxazn/crawl4ai
 
 jobs:
   sync:
@@ -98,6 +99,16 @@ jobs:
             release_exists=false
           fi
 
+          # Docker publication is tracked independently of the release: a run that dies after
+          # creating the release but before the image dispatch must be able to retry just the
+          # image. The image tag is the sync tag itself (docker-release derives the version
+          # from `-f tag`), so the registry answers "is this published yet?".
+          if curl -fsS "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${tag}" > /dev/null 2>&1; then
+            image_exists=true
+          else
+            image_exists=false
+          fi
+
           {
             echo "merge_base=${merge_base}"
             echo "upstream_sha=${upstream_sha}"
@@ -106,11 +117,13 @@ jobs:
             echo "tag=${tag}"
             echo "tag_exists=${tag_exists}"
             echo "release_exists=${release_exists}"
+            echo "image_exists=${image_exists}"
             if [ "${ahead}" = "0" ]; then echo "has_changes=false"; else echo "has_changes=true"; fi
           } >> "$GITHUB_OUTPUT"
 
           echo "Upstream ${upstream_sha} is ${ahead} commit(s) ahead of the merge base." \
-            "Target branch is at ${target_sha}. tag_exists=${tag_exists} release_exists=${release_exists}."
+            "Target branch is at ${target_sha}." \
+            "tag_exists=${tag_exists} release_exists=${release_exists} image_exists=${image_exists}."
 
       - name: Merge upstream into the sync branch
         id: merge
@@ -161,7 +174,8 @@ jobs:
           if [ "${{ steps.detect.outputs.has_changes }}" = "true" ] \
              || [ "${{ inputs.dry_run }}" = "true" ] \
              || [ "${{ steps.detect.outputs.tag_exists }}" = "false" ] \
-             || [ "${{ steps.detect.outputs.release_exists }}" = "false" ]; then
+             || [ "${{ steps.detect.outputs.release_exists }}" = "false" ] \
+             || [ "${{ steps.detect.outputs.image_exists }}" = "false" ]; then
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
@@ -226,10 +240,22 @@ jobs:
           installed="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,os;print(os.path.realpath(crawl4ai.__file__))')"
           echo "image installed crawl4ai from: ${installed}"
 
+          # `crawl4ai.__file__` only proves the package was imported; the same path shows up
+          # whether the image installed this checkout or a downloaded release. Compare a file
+          # hash instead, so the claim "the image contains this tree" is actually tested.
+          in_image="$(docker run --rm --entrypoint python3 crawl4ai-sync:validate -c 'import crawl4ai,hashlib,os;print(hashlib.sha256(open(os.path.realpath(crawl4ai.__file__),"rb").read()).hexdigest())')"
+          in_repo="$(python3 -c 'import hashlib,pathlib;print(hashlib.sha256(pathlib.Path("crawl4ai/__init__.py").read_bytes()).hexdigest())')"
+          echo "crawl4ai/__init__.py sha256: image=${in_image} repo=${in_repo}"
+          if [ "${in_image}" != "${in_repo}" ]; then
+            fail "the image does not contain this checkout (sha256 mismatch)"
+          fi
+
           # Assertions run inside the container so a shell compare can never fail on
           # formatting: each check prints what it saw and exits non-zero on a mismatch.
+          # `-i` is required: without it docker does not forward the heredoc on stdin and
+          # python runs an empty program, which exits 0 and makes the whole gate a no-op.
           check() {  # check <container> <path> <method> <expected>
-            docker exec "$1" python3 - "$2" "$3" "$4" <<'CHK'
+            docker exec -i "$1" python3 - "$2" "$3" "$4" <<'CHK'
           import sys, urllib.request, urllib.error
           path, method, want = sys.argv[1], sys.argv[2], int(sys.argv[3])
           req = urllib.request.Request(
@@ -265,6 +291,15 @@ jobs:
           # No credential configured: loopback bind, /token fails closed, MCP unreachable.
           cid="$(docker run -d --name sync-no-credential crawl4ai-sync:validate)"
           wait_ready "${cid}" || fail "container without credentials never became healthy"
+
+          # Prove the helper itself can fail. A wrong expectation must exit non-zero, otherwise
+          # every "expected X" below is decoration (this is exactly how a docker-exec gate
+          # silently passes when stdin is not attached).
+          if check "${cid}" /health GET 418 > /dev/null 2>&1; then
+            fail "the container assertion helper cannot fail; the gate is not real"
+          fi
+          echo "container assertion helper verified: a wrong expectation fails"
+
           check "${cid}" /health GET 200 || fail "/health is not 200 without credentials"
           check "${cid}" /token POST 403 || fail "/token did not fail closed without credentials"
           check "${cid}" /mcp/sse GET 401 || fail "/mcp/sse is reachable without a credential"
@@ -350,7 +385,7 @@ jobs:
           token: ${{ github.token }}
 
       - name: Publish the Docker image for this tag
-        if: steps.state.outputs.release_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
+        if: steps.detect.outputs.image_exists == 'false' && inputs.dry_run != true && steps.plan.outputs.build_needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           TAG: ${{ steps.detect.outputs.tag }}
@@ -387,7 +422,8 @@ jobs:
             echo "| changes | ${{ steps.detect.outputs.has_changes }} |"
             echo "| merge commit | \`${{ steps.state.outputs.head_sha }}\` |"
             echo "| tag | \`${{ steps.detect.outputs.tag }}\` |"
-            echo "| tag existed | ${{ steps.state.outputs.tag_exists }} |"
-            echo "| release existed | ${{ steps.state.outputs.release_exists }} |"
+            echo "| tag existed | ${{ steps.detect.outputs.tag_exists }} |"
+            echo "| release existed | ${{ steps.detect.outputs.release_exists }} |"
+            echo "| image existed | ${{ steps.detect.outputs.image_exists }} |"
             echo "| validation ran | ${{ steps.plan.outputs.build_needed }} |"
           } >> "$GITHUB_STEP_SUMMARY"
