@@ -203,10 +203,12 @@ jobs:
 
           action="built"
           digest="${DIGEST}"
+          revision="${REV:-unknown}"
           if [ "${SKIPPED:-false}" = "true" ] || [ -z "${digest}" ]; then
-            # A skipped build has no build-push digest. Report the digest that is actually
-            # published for this version, and say so, instead of emitting "none" and making
-            # the consumer reject a perfectly valid image.
+            # A skipped build has no build-push digest. Report the digest and revision that are
+            # actually published for this version, and say so, instead of emitting "none" and
+            # making the consumer reject a perfectly valid image (or crediting this checkout for
+            # an image some earlier run built).
             action="reused"
             code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
               "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}" || echo 000)"
@@ -221,15 +223,27 @@ jobs:
               echo "::error::could not read the published digest for ${VERSION}"
               exit 1
             fi
+            # The revision of a reused image is whatever that image says, not this checkout.
+            docker pull --quiet "${IMAGE_NAME}:${VERSION}" > /dev/null
+            observed="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "${IMAGE_NAME}:${VERSION}" 2>/dev/null || true)"
+            if [ -z "${observed}" ]; then
+              echo "::error::${IMAGE_NAME}:${VERSION} carries no org.opencontainers.image.revision label"
+              exit 1
+            fi
+            revision="${observed}"
           fi
 
           # Machine-readable markers: the sync workflow reads them back from this run's log
           # to tie the published digest to the publisher it selected, instead of comparing a
-          # tag against itself.
+          # tag against itself. `requested-revision` is what this run checked out;
+          # `published-revision` is what the published image claims.
           echo "::notice::published-action=${action}"
-          echo "::notice::published-revision=${REV:-unknown}"
+          echo "::notice::requested-revision=${REV:-unknown}"
+          echo "::notice::published-revision=${revision}"
           echo "::notice::published-digest=${digest}"
           echo "published-action=${action}"
-          echo "published-revision=${REV:-unknown}"
+          echo "requested-revision=${REV:-unknown}"
+          echo "published-revision=${revision}"
           echo "published-digest=${digest}"
           echo "published-version=${VERSION:-unknown}"

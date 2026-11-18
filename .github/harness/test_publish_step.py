@@ -93,8 +93,11 @@ if args[:2] == ["run", "view"]:
     if "--log" in args:
         if run.get("final_status") != "completed":
             sys.exit(1)
-        print(f"sync\tReport what this run published\tpublished-revision={run.get('publisher_revision', '')}")
-        print(f"sync\tReport what this run published\tpublished-digest={run.get('publisher_digest', '')}")
+        for line in run.get("log_lines", []):
+            print(f"sync\tReport what this run published\t{line}")
+        if not run.get("log_lines"):
+            print(f"sync\tReport what this run published\tpublished-revision={run.get('publisher_revision', '')}")
+            print(f"sync\tReport what this run published\tpublished-digest={run.get('publisher_digest', '')}")
         sys.exit(0)
     if jq == ".headSha":
         out(run["headSha"])
@@ -327,6 +330,46 @@ def main() -> int:
             {**base, "publisher_action": "reused"}, False, 0,
             lambda out, final: (
                 [] if f"digest {DIGEST}" in out else ["a reused publication was not accepted"]
+            )))
+
+        # End-to-end chain: run the reporter step for a skipped build, feed its actual
+        # output to the consumer, and require the consumer to accept it.
+        reporter_body, _ = extract_step(RELEASE_WORKFLOW, REPORT_STEP)
+        chain_dir = root / "chain-reporter"
+        chain_dir.mkdir()
+        chain_bin = chain_dir / "bin"
+        chain_bin.mkdir()
+        write_fakes(chain_bin)
+        chain_state = chain_dir / "state.json"
+        chain_state.write_text(json.dumps({"registry_code": 200, "registry_digest": DIGEST,
+                                          "image_label": SHA, "image_digest": DIGEST, "runs": []}),
+                              encoding="utf-8")
+        chain_script = chain_dir / "report.sh"
+        chain_script.write_text(reporter_body + "\n", encoding="utf-8")
+        chain_env = dict(os.environ)
+        chain_env["PATH"] = f"{chain_bin}{os.pathsep}{chain_env['PATH']}"
+        chain_env["STATE_FILE"] = str(chain_state)
+        chain_env["IMAGE_NAME"] = "cpxazn/crawl4ai"
+        chain_env["VERSION"] = TAG
+        chain_env["REV"] = SHA
+        chain_env["DIGEST"] = ""
+        chain_env["SKIPPED"] = "true"
+        reporter_run = subprocess.run(["bash", str(chain_script)], env=chain_env, capture_output=True, text=True)
+        reporter_lines = [line for line in reporter_run.stdout.splitlines()
+                          if line.startswith(("published-action=", "published-revision=",
+                                              "published-digest=", "requested-revision="))]
+        results.append(run_publish_case(
+            root, SYNC_WORKFLOW, "reporter-to-consumer",
+            {**base,
+             "runs": [{**old_failed, "databaseId": 777, "status": "in_progress",
+                       "final_status": "completed", "final_conclusion": "success",
+                       "log_lines": reporter_lines}]}, False, 0,
+            lambda out, final: (
+                [] if reporter_run.returncode == 0
+                and "adopting in-flight publication run 777" in out
+                and f"digest {DIGEST}" in out
+                and any(line.startswith("published-action=reused") for line in reporter_lines)
+                else ["the reporter's own output did not satisfy the consumer"] + reporter_lines
             )))
 
         # Verification-failure-then-retry: the first attempt fails on the label, and the
